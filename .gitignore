@@ -1,0 +1,15 @@
+# Общие игнорируемые файлы
+*.log
+.env
+.env.local
+__pycache__/
+*.pyc
+.vscode/
+.idea/
+
+
+
+# Backend (Python, FastAPI)
+venv/
+.mypy_cache/
+.pytest_cache/
