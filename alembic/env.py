@@ -4,9 +4,7 @@ import os
 import sys
 import os
 
-url = os.environ.get("DATABASE_URL")
-if url:
-    config.set_main_option("sqlalchemy.url", url)
+
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'src')))
 from src.db import Base
@@ -14,6 +12,10 @@ from logging.config import fileConfig
 from sqlalchemy import engine_from_config, pool
 from alembic import context
 
+url = os.environ.get("DATABASE_URL")
+if url:
+    config.set_main_option("sqlalchemy.url", url)
+    
 config = context.config
 fileConfig(config.config_file_name)
 target_metadata = Base.metadata
