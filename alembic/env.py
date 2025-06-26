@@ -2,30 +2,23 @@ from logging.config import fileConfig
 import os
 import sys
 
-from sqlalchemy import engine_from_config, pool
+from sqlalchemy import create_engine, pool
 from alembic import context
 from dotenv import load_dotenv
 
-# Загружаем переменные окружения
 load_dotenv()
-
-config = context.config
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'src')))
 from src.db import Base
 
-# Конфигурируем логирование (ВЫЗОВ fileConfig ДОЛЖЕН БЫТЬ ПЕРЕД set_main_option!)
+config = context.config
 fileConfig(config.config_file_name)
 
-# Только теперь подставляем url из env!
-url = os.environ.get("DATABASE_URL")
-if url:
-    config.set_main_option("sqlalchemy.url", url)
-
 target_metadata = Base.metadata
+url = os.environ.get("DATABASE_URL")  # Просто получаем url, не трогаем config
 
 def run_migrations_offline():
-    url = config.get_main_option("sqlalchemy.url")
+    """Run migrations in 'offline' mode."""
     context.configure(
         url=url, target_metadata=target_metadata, literal_binds=True, compare_type=True
     )
@@ -33,9 +26,9 @@ def run_migrations_offline():
         context.run_migrations()
 
 def run_migrations_online():
-    connectable = engine_from_config(
-        config.get_section(config.config_ini_section),
-        prefix="sqlalchemy.",
+    """Run migrations in 'online' mode."""
+    connectable = create_engine(
+        url,
         poolclass=pool.NullPool,
     )
     with connectable.connect() as connection:
