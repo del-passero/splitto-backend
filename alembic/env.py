@@ -1,5 +1,12 @@
+from dotenv import load_dotenv
+load_dotenv()
+import os
 import sys
 import os
+
+url = os.environ.get("DATABASE_URL")
+if url:
+    config.set_main_option("sqlalchemy.url", url)
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'src')))
 from src.db import Base
