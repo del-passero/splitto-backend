@@ -35,13 +35,14 @@ app.add_middleware(
 )
 
 # --- Подключение роутеров ---
-app.include_router(auth_router, prefix="/auth", tags=["Авторизация"])
-app.include_router(users_router, prefix="/users", tags=["Пользователи"])
-app.include_router(groups_router, prefix="/groups", tags=["Группы"])
-app.include_router(group_members_router, prefix="/group_members", tags=["Участники группы"])
-app.include_router(friends_router, prefix="/friends", tags=["Друзья и контакты"])
-app.include_router(expense_categories_router, prefix="/expense-categories", tags=["Категории расходов"])
-app.include_router(transactions_router, prefix="/transactions", tags=["Транзакции"])
+app.include_router(auth_router, prefix="/api/auth", tags=["Авторизация"])
+app.include_router(users_router, prefix="/api/users", tags=["Пользователи"])
+app.include_router(groups_router, prefix="/api/groups", tags=["Группы"])
+app.include_router(group_members_router, prefix="/api/group_members", tags=["Участники группы"])
+app.include_router(friends_router, prefix="/api/friends", tags=["Друзья и контакты"])
+app.include_router(expense_categories_router, prefix="/api/expense-categories", tags=["Категории расходов"])
+app.include_router(transactions_router, prefix="/api/transactions", tags=["Транзакции"])
+
 
 @app.get("/")
 def root():
@@ -53,3 +54,6 @@ def root():
         "docs": "/docs",
         "users_me_example": "/users/me (нужно передавать initData!)"
     }
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("src.main:app", host="0.0.0.0", port=8000, reload=False)
