@@ -28,7 +28,10 @@ app.add_middleware(
     allow_origins=[
     "http://localhost:3000",
     "http://127.0.0.1:3000",
-    "https://splitto.app"],
+    "https://splitto.app",
+    "https://www.splitto.app",
+    "amvera-ugraf-run-splitto-backend-prod",
+    "https://splitto-backend-prod-ugraf.amvera.io"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
