@@ -26,12 +26,13 @@ app = FastAPI(
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
-    "http://localhost:3000",
-    "http://127.0.0.1:3000",
-    "https://splitto.app",
-    "https://www.splitto.app",
-    "amvera-ugraf-run-splitto-backend-prod",
-    "https://splitto-backend-prod-ugraf.amvera.io"],
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+        "https://splitto.app",
+        "https://www.splitto.app",
+        "amvera-ugraf-run-splitto-backend-prod",
+        "https://splitto-backend-prod-ugraf.amvera.io"
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -57,6 +58,7 @@ def root():
         "docs": "/docs",
         "users_me_example": "/users/me (нужно передавать initData!)"
     }
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("src.main:app", host="0.0.0.0", port=8000, reload=False)
