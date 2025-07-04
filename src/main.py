@@ -17,6 +17,8 @@ from src.routers.expense_categories import router as expense_categories_router
 from src.routers.transactions import router as transactions_router
 from src.routers.auth import router as auth_router
 
+
+
 app = FastAPI(
     title="Splitto Backend",
     description="Splitwise-like Telegram WebApp backend. Все API реализованы с учётом поддержки Telegram-style UI и расширенной логики.",
