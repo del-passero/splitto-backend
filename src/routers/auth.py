@@ -1,5 +1,3 @@
-# src/routers/auth.py
-
 from fastapi import APIRouter, Depends, Form, HTTPException
 from sqlalchemy.orm import Session
 from src.db import get_db
@@ -15,27 +13,26 @@ router = APIRouter()
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "7924065368:AAEXitusSdortU0C1yqLVmkU_yv4uZ_yI9Q")
 
-
 def check_telegram_auth(init_data: str, bot_token: str) -> dict:
     req_data = urllib.parse.parse_qs(init_data, keep_blank_values=True)
-    if 'hash' not in req_
+    
+    if 'hash' not in req_data:
         raise HTTPException(status_code=401, detail="Нет hash в initData")
     hash_from_telegram = req_data.pop('hash')[0]
 
     data_check_string = '\n'.join(f"{k}={v[0]}" for k, v in sorted(req_data.items()))
-
+    
     secret_key = hashlib.sha256(bot_token.encode()).digest()
     calculated_hash = hmac.new(secret_key, data_check_string.encode(), hashlib.sha256).hexdigest()
 
     if not hmac.compare_digest(calculated_hash, hash_from_telegram):
         raise HTTPException(status_code=401, detail="Неверная подпись Telegram WebApp")
-
+    
     return req_data
-
 
 @router.post("/telegram", response_model=UserOut)
 async def auth_via_telegram(
-    initData: str = Form(...),  # ← Получаем как form-data
+    initData: str = Form(...),  # Получаем как form-data
     db: Session = Depends(get_db)
 ):
     parsed = check_telegram_auth(initData, TELEGRAM_BOT_TOKEN)
@@ -78,4 +75,10 @@ async def auth_via_telegram(
         db.commit()
         db.refresh(user_obj)
 
-    return user_obj
+    return {
+        "id": user_obj.id,
+        "telegram_id": user_obj.telegram_id,
+        "name": user_obj.name,
+        "username": user_obj.username,
+        "photo_url": user_obj.photo_url
+    }
