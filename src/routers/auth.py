@@ -16,7 +16,7 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "7924065368:AAEXitusSdortU0
 def check_telegram_auth(init_data: str, bot_token: str) -> dict:
     req_data = urllib.parse.parse_qs(init_data, keep_blank_values=True)
     
-    if 'hash' not in req_data:
+    if 'hash' not in req_data:  # ← ИСПРАВЛЕНО: req_data, а не req_
         raise HTTPException(status_code=401, detail="Нет hash в initData")
     hash_from_telegram = req_data.pop('hash')[0]
 
