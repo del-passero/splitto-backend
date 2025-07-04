@@ -11,9 +11,11 @@ import hmac
 import urllib.parse
 import os
 
-router = APIRouter()
-
+# Вставляем сюда переменную окружения для Telegram Bot Token и лог
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "PASTE_YOUR_BOT_TOKEN")
+print("DEBUG | TELEGRAM_BOT_TOKEN:", repr(TELEGRAM_BOT_TOKEN))
+
+router = APIRouter()
 
 def check_telegram_auth(init_data: str, bot_token: str) -> dict:
     """
@@ -24,8 +26,19 @@ def check_telegram_auth(init_data: str, bot_token: str) -> dict:
     data_check_string = '\n'.join(f"{k}={v}" for k, v in sorted(parsed.items()))
     secret_key = hashlib.sha256(bot_token.encode()).digest()
     calculated_hash = hmac.new(secret_key, data_check_string.encode(), hashlib.sha256).hexdigest()
+
+    # Выводим всё, что важно для отладки
+    print("DEBUG | check_telegram_auth")
+    print("  init_data =", repr(init_data))
+    print("  bot_token =", repr(bot_token))
+    print("  data_check_string =", repr(data_check_string))
+    print("  calculated_hash =", calculated_hash)
+    print("  hash_from_telegram =", hash_from_telegram)
+
     if not hmac.compare_digest(calculated_hash, hash_from_telegram):
+        print("  ❌ Подпись не совпадает!")
         raise HTTPException(401, "Неверная подпись Telegram WebApp (initData)")
+    print("  ✅ Подпись ОК")
     return parsed
 
 @router.post("/telegram", response_model=UserOut)
@@ -36,6 +49,7 @@ async def auth_via_telegram(request: Request, db: Session = Depends(get_db)):
     """
     data = await request.json()
     init_data = data.get("initData")
+    print("DEBUG | /api/auth/telegram | init_data =", repr(init_data))
     if not init_data:
         raise HTTPException(400, "initData is required")
     parsed = check_telegram_auth(init_data, TELEGRAM_BOT_TOKEN)
@@ -67,6 +81,7 @@ async def auth_via_telegram(request: Request, db: Session = Depends(get_db)):
         db.add(user)
         db.commit()
         db.refresh(user)
+        print(f"DEBUG | Новый пользователь создан: {user}")
     else:
         # Обновляем имя, если first_name или last_name поменялись
         user.first_name = first_name
@@ -77,4 +92,5 @@ async def auth_via_telegram(request: Request, db: Session = Depends(get_db)):
         user.name = name  # Обновляем name!
         db.commit()
         db.refresh(user)
+        print(f"DEBUG | Пользователь обновлён: {user}")
     return user
