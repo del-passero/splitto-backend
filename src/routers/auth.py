@@ -8,38 +8,39 @@ from src.schemas.user import UserOut
 from src.utils.user import get_display_name
 import hashlib
 import hmac
-import json
 import os
+import json
 
 router = APIRouter()
 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "PASTE_YOUR_BOT_TOKEN")
 
 def check_telegram_auth(init_data: str, bot_token: str) -> dict:
-    """
-    Проверяет подпись Telegram WebApp.
-    ВАЖНО: строку initData нельзя парсить или декодировать, она должна остаться в raw-форме!
-    """
     print("[check_telegram_auth] start")
     print("init_data:", init_data)
     print("bot_token:", repr(bot_token))
 
-    items = [item for item in init_data.split('&')]
-    data_pairs = []
-    hash_from_telegram = ""
-    for item in items:
+    # 1. Ищем hash, signature удаляем, собираем пары
+    pairs = []
+    hash_from_telegram = None
+    for item in init_data.split('&'):
         if item.startswith("hash="):
             hash_from_telegram = item[len("hash="):]
         elif item.startswith("signature="):
             print("WARNING: signature не должен быть в initData, удаляем")
             continue
         else:
-            data_pairs.append(item)
-    data_pairs.sort(key=lambda s: s.split('=')[0])
-    data_check_string = '\n'.join(data_pairs)
+            pairs.append(item)
+    if not hash_from_telegram:
+        print("❌ Нет параметра hash!")
+        raise HTTPException(401, "Параметр hash не найден")
 
+    # 2. Сортируем по ключу
+    pairs_sorted = sorted(pairs, key=lambda x: x.split('=')[0])
+    data_check_string = '\n'.join(pairs_sorted)
     print("data_check_string:\n" + data_check_string)
 
+    # 3. Считаем подпись
     secret_key = hashlib.sha256(bot_token.encode()).digest()
     calculated_hash = hmac.new(secret_key, data_check_string.encode(), hashlib.sha256).hexdigest()
     print("calculated_hash:", calculated_hash)
@@ -49,17 +50,18 @@ def check_telegram_auth(init_data: str, bot_token: str) -> dict:
         raise HTTPException(401, "Неверная подпись Telegram WebApp (initData)")
     print("✅ Подпись совпала!")
 
-    # Формируем dict для возвращения в handler
+    # Возвращаем пары как dict (строки! user — строка)
     parsed_dict = {}
-    for pair in data_pairs:
-        key, value = pair.split("=", 1)
-        parsed_dict[key] = value
+    for pair in pairs_sorted:
+        k, v = pair.split("=", 1)
+        parsed_dict[k] = v
     return parsed_dict
 
 @router.post("/telegram", response_model=UserOut)
 async def auth_via_telegram(request: Request, db: Session = Depends(get_db)):
     """
-    Принимает {"initData": "..."} от фронта, валидирует, сохраняет пользователя.
+    Аутентификация через Telegram WebApp. Принимает initData, проверяет подпись,
+    создаёт/обновляет пользователя, возвращает UserOut.
     """
     data = await request.json()
     init_data = data.get("initData")
@@ -68,17 +70,21 @@ async def auth_via_telegram(request: Request, db: Session = Depends(get_db)):
         raise HTTPException(400, "initData is required")
     parsed = check_telegram_auth(init_data, TELEGRAM_BOT_TOKEN)
 
-    # Важно: user — строка в формате JSON
-    user_data = json.loads(parsed["user"])
-    telegram_id = int(user_data["id"])
-    first_name = user_data.get("first_name", "")
-    last_name = user_data.get("last_name", "")
-    username = user_data.get("username", "")
-    photo_url = user_data.get("photo_url", "")
-    language_code = user_data.get("language_code", "")
+    # Достаем user-строку и парсим только ПОСЛЕ проверки подписи
+    user_raw = parsed.get("user")
+    if not user_raw:
+        raise HTTPException(400, "user missing in initData")
+    user_json = json.loads(user_raw)
+
+    telegram_id = int(user_json.get("id"))
+    first_name = user_json.get("first_name")
+    last_name = user_json.get("last_name")
+    username = user_json.get("username")
+    photo_url = user_json.get("photo_url")
+    language_code = user_json.get("language_code")
     name = get_display_name(first_name, last_name, username, telegram_id)
 
-    # Создаем/обновляем пользователя
+    # Найти пользователя или создать
     user = db.query(User).filter_by(telegram_id=telegram_id).first()
     if not user:
         user = User(
