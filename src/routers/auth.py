@@ -9,82 +9,72 @@ from src.utils.user import get_display_name
 import hashlib
 import hmac
 import os
+import urllib.parse
 import json
 
 router = APIRouter()
 
-TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "PASTE_YOUR_BOT_TOKEN")
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "7924065368:AAEXitusSdortU0C1yqLVmkU_yv4uZ_yI9Q")
 
 def check_telegram_auth(init_data: str, bot_token: str) -> dict:
-    print("[check_telegram_auth] start")
+    print("=== [check_telegram_auth] start ===")
     print("init_data:", init_data)
     print("bot_token:", repr(bot_token))
 
-    # 1. Ищем hash, signature удаляем, собираем пары
-    pairs = []
+    # Парсим init_data как key=value (без decode!)
+    parsed = []
     hash_from_telegram = None
     for item in init_data.split('&'):
-        if item.startswith("hash="):
-            hash_from_telegram = item[len("hash="):]
-        elif item.startswith("signature="):
-            print("WARNING: signature не должен быть в initData, удаляем")
-            continue
+        k, v = item.split('=', 1)
+        if k == 'hash':
+            hash_from_telegram = v
+        elif k == 'signature':
+            print("WARNING: signature не нужен — пропускаем")
         else:
-            pairs.append(item)
+            parsed.append((k, v))
     if not hash_from_telegram:
-        print("❌ Нет параметра hash!")
-        raise HTTPException(401, "Параметр hash не найден")
+        raise HTTPException(401, "Нет параметра hash в initData!")
 
-    # 2. Сортируем по ключу
-    pairs_sorted = sorted(pairs, key=lambda x: x.split('=')[0])
-    data_check_string = '\n'.join(pairs_sorted)
-    print("data_check_string:\n" + data_check_string)
+    # Строго сортируем по ключу (ключ=значение, значения — как есть!)
+    parsed.sort(key=lambda x: x[0])
+    data_check_string = '\n'.join(f"{k}={v}" for k, v in parsed)
+    print("data_check_string:\n", data_check_string)
 
-    # 3. Считаем подпись
+    # Считаем hash через HMAC-SHA256 c ключом SHA256(bot_token)
     secret_key = hashlib.sha256(bot_token.encode()).digest()
     calculated_hash = hmac.new(secret_key, data_check_string.encode(), hashlib.sha256).hexdigest()
     print("calculated_hash:", calculated_hash)
     print("hash_from_telegram:", hash_from_telegram)
+
     if not hmac.compare_digest(calculated_hash, hash_from_telegram):
         print("❌ Подпись не совпадает!")
         raise HTTPException(401, "Неверная подпись Telegram WebApp (initData)")
-    print("✅ Подпись совпала!")
 
-    # Возвращаем пары как dict (строки! user — строка)
-    parsed_dict = {}
-    for pair in pairs_sorted:
-        k, v = pair.split("=", 1)
-        parsed_dict[k] = v
-    return parsed_dict
+    print("✅ Подпись совпадает!")
+    # Возвращаем dict из оригинальных ключей
+    return {k: v for k, v in parsed}
 
 @router.post("/telegram", response_model=UserOut)
 async def auth_via_telegram(request: Request, db: Session = Depends(get_db)):
-    """
-    Аутентификация через Telegram WebApp. Принимает initData, проверяет подпись,
-    создаёт/обновляет пользователя, возвращает UserOut.
-    """
     data = await request.json()
     init_data = data.get("initData")
     print(f"[/api/auth/telegram] initData = {init_data}")
     if not init_data:
         raise HTTPException(400, "initData is required")
+
     parsed = check_telegram_auth(init_data, TELEGRAM_BOT_TOKEN)
+    # user — строка, парсим только после валидации
+    user_str = urllib.parse.unquote(parsed.get("user"))
+    user_obj = json.loads(user_str)
 
-    # Достаем user-строку и парсим только ПОСЛЕ проверки подписи
-    user_raw = parsed.get("user")
-    if not user_raw:
-        raise HTTPException(400, "user missing in initData")
-    user_json = json.loads(user_raw)
-
-    telegram_id = int(user_json.get("id"))
-    first_name = user_json.get("first_name")
-    last_name = user_json.get("last_name")
-    username = user_json.get("username")
-    photo_url = user_json.get("photo_url")
-    language_code = user_json.get("language_code")
+    telegram_id = int(user_obj["id"])
+    first_name = user_obj.get("first_name")
+    last_name = user_obj.get("last_name")
+    username = user_obj.get("username")
+    photo_url = user_obj.get("photo_url")
+    language_code = user_obj.get("language_code")
     name = get_display_name(first_name, last_name, username, telegram_id)
 
-    # Найти пользователя или создать
     user = db.query(User).filter_by(telegram_id=telegram_id).first()
     if not user:
         user = User(
