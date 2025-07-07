@@ -52,4 +52,11 @@ async def get_me(current_user: User = Depends(get_current_telegram_user)):
     )
     return current_user
 
+
+@router.get("/", response_model=List[UserOut])
+def get_all_users(db: Session = Depends(get_db)):
+    """
+    Возвращает список всех пользователей.
+    """
+    return db.query(User).order_by(User.id).all()
 # остальные роуты не меняем
