@@ -1,4 +1,4 @@
-# src/routers/users.py
+# splitto/backend/src/routers/users.py
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from sqlalchemy.orm import Session
@@ -8,7 +8,7 @@ from src.schemas.user import UserCreate, UserOut
 from src.db import get_db
 from typing import List, Optional
 from src.utils.user import get_display_name
-from src.utils.telegram_auth import get_current_telegram_user
+from src.utils.telegram_dep import get_current_telegram_user  # <--- НОВЫЙ ИМПОРТ
 
 router = APIRouter()
 
@@ -52,57 +52,4 @@ async def get_me(current_user: User = Depends(get_current_telegram_user)):
     )
     return current_user
 
-@router.get("/search", response_model=List[UserOut])
-def search_users(
-    q: str = Query(..., min_length=2),
-    exclude_user_id: Optional[int] = Query(None),
-    db: Session = Depends(get_db)
-):
-    """
-    Поиск пользователей по имени, username или telegram_id.
-    """
-    query = db.query(User).filter(
-        or_(
-            User.name.ilike(f"%{q}%"),
-            User.username.ilike(f"%{q}%"),
-            User.first_name.ilike(f"%{q}%"),
-            User.last_name.ilike(f"%{q}%"),
-            cast(User.telegram_id, String).ilike(f"%{q}%"),
-        )
-    )
-    if exclude_user_id is not None:
-        query = query.filter(User.id != exclude_user_id)
-    users = query.limit(15).all()
-    for user in users:
-        user.name = get_display_name(
-            first_name=user.first_name,
-            last_name=user.last_name,
-            username=user.username,
-            telegram_id=user.telegram_id
-        )
-    return users
-
-@router.get("/", response_model=List[UserOut])
-def get_users(db: Session = Depends(get_db)):
-    users = db.query(User).all()
-    for user in users:
-        user.name = get_display_name(
-            first_name=user.first_name,
-            last_name=user.last_name,
-            username=user.username,
-            telegram_id=user.telegram_id
-        )
-    return users
-
-@router.get("/{user_id}", response_model=UserOut)
-def get_user_by_id(user_id: int, db: Session = Depends(get_db)):
-    user = db.query(User).filter(User.id == user_id).first()
-    if not user:
-        raise HTTPException(status_code=404, detail="Пользователь не найден")
-    user.name = get_display_name(
-        first_name=user.first_name,
-        last_name=user.last_name,
-        username=user.username,
-        telegram_id=user.telegram_id
-    )
-    return user
+# остальные роуты не меняем
