@@ -1,6 +1,6 @@
 # src/models/user.py
 
-from sqlalchemy import Column, Integer, String, Boolean, DateTime, func
+from sqlalchemy import Column, BigInteger, Integer, String, Boolean, DateTime, func
 from src.db import Base
 
 class User(Base):
@@ -23,7 +23,7 @@ class User(Base):
     __tablename__ = "users"
 
     id = Column(Integer, primary_key=True, index=True)
-    telegram_id = Column(Integer, unique=True, index=True, nullable=False)
+    telegram_id = Column(BigInteger, unique=True, nullable=False, index=True)
     username = Column(String, index=True, nullable=True)
     first_name = Column(String, nullable=True)
     last_name = Column(String, nullable=True)
