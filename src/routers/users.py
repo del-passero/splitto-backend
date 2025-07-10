@@ -1,4 +1,4 @@
-# splitto/backend/src/routers/users.py
+# src/routers/users.py
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from sqlalchemy.orm import Session
@@ -16,6 +16,7 @@ router = APIRouter()
 def create_user(user: UserCreate, db: Session = Depends(get_db)):
     """
     Создать нового пользователя. Поле name всегда first_name + last_name (или username, если нет).
+    Можно сразу указать is_pro и invited_friends_count (например, для тестов/админки).
     """
     display_name = get_display_name(
         first_name=getattr(user, "first_name", ""),
@@ -32,6 +33,9 @@ def create_user(user: UserCreate, db: Session = Depends(get_db)):
         photo_url=getattr(user, "photo_url", None),
         language_code=getattr(user, "language_code", None),
         allows_write_to_pm=getattr(user, "allows_write_to_pm", True),
+        # --- Новые поля для PRO-статуса и счётчика ---
+        is_pro=getattr(user, "is_pro", False),
+        invited_friends_count=getattr(user, "invited_friends_count", 0)
     )
     db.add(db_user)
     db.commit()
@@ -43,7 +47,6 @@ async def get_me(current_user: User = Depends(get_current_telegram_user)):
     """
     Возвращает данные текущего пользователя через Telegram WebApp initData.
     """
-    # name всегда в правильном формате
     current_user.name = get_display_name(
         first_name=current_user.first_name,
         last_name=current_user.last_name,
@@ -52,11 +55,9 @@ async def get_me(current_user: User = Depends(get_current_telegram_user)):
     )
     return current_user
 
-
 @router.get("/", response_model=List[UserOut])
 def get_all_users(db: Session = Depends(get_db)):
     """
     Возвращает список всех пользователей.
     """
     return db.query(User).order_by(User.id).all()
-# остальные роуты не меняем
