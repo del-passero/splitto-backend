@@ -17,6 +17,7 @@ class FriendOut(BaseModel):
     Содержит:
         - даты создания/обновления
         - вложенные объекты user и friend (UserOut) для удобства фронта
+        - статус hidden
     """
     id: int
     user_id: int
@@ -25,6 +26,7 @@ class FriendOut(BaseModel):
     updated_at: datetime
     user: UserOut
     friend: UserOut
+    hidden: bool
 
     class Config:
         from_attributes = True

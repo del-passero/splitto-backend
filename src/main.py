@@ -20,6 +20,7 @@ from src.routers.groups import router as groups_router
 from src.routers.group_members import router as group_members_router
 from src.routers.transactions import router as transactions_router
 from src.routers.friends import router as friends_router
+from src.routers.events import router as events_router  # ДОБАВИЛ!
 from src.routers.expense_categories import router as expense_categories_router
 
 app = FastAPI(
@@ -50,6 +51,7 @@ app.include_router(groups_router, prefix="/api/groups", tags=["Группы"])
 app.include_router(group_members_router, prefix="/api/group-members", tags=["Участники групп"])
 app.include_router(transactions_router, prefix="/api/transactions", tags=["Транзакции"])
 app.include_router(friends_router, prefix="/api/friends", tags=["Друзья"])
+app.include_router(events_router, prefix="/api/events", tags=["События"])  # <-- ЭТО ВАЖНО: теперь events подключён!
 app.include_router(expense_categories_router, prefix="/api/expense-categories", tags=["Категории расходов"])
 
 @app.get("/")
