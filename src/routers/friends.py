@@ -12,6 +12,7 @@ from src.models.event import Event
 from src.schemas.friend import FriendOut, FriendCreate
 from src.schemas.friend_invite import FriendInviteOut
 from src.schemas.invite_usage import InviteUsageOut
+from src.schemas.user import UserOut
 from src.utils.telegram_dep import get_current_telegram_user
 import secrets
 from datetime import datetime
@@ -26,32 +27,30 @@ def get_friends(
 ):
     """
     Получить список друзей текущего пользователя.
-    В поле "user" будет именно профиль друга (friend_id), а не твой собственный!
+    В поле "user" будет профиль друга, в поле "friend" — твой профиль.
     """
     query = db.query(Friend).filter(Friend.user_id == current_user.id)
     if show_hidden is not None:
         query = query.filter(Friend.hidden == show_hidden)
     friends = query.all()
 
-    # Формируем результат вручную: "user" — всегда твой друг!
     result = []
     for friend in friends:
+        # Получаем объект друга
         friend_profile = db.query(User).filter(User.id == friend.friend_id).first()
-        result.append({
-            "id": friend.id,
-            "user": {
-                "id": friend_profile.id,
-                "first_name": friend_profile.first_name,
-                "last_name": friend_profile.last_name,
-                "username": friend_profile.username,
-                "photo_url": friend_profile.photo_url
-            },
-            "created_at": friend.created_at,
-            "updated_at": friend.updated_at,
-            "hidden": friend.hidden
-        })
+        result.append(
+            FriendOut(
+                id=friend.id,
+                user_id=friend.user_id,
+                friend_id=friend.friend_id,
+                created_at=friend.created_at,
+                updated_at=friend.updated_at,
+                hidden=friend.hidden,
+                user=UserOut.from_orm(friend_profile),
+                friend=UserOut.from_orm(current_user)
+            )
+        )
     return result
-
 
 @router.post("/invite", response_model=FriendInviteOut)
 def create_invite(
