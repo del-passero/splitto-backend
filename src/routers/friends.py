@@ -26,14 +26,32 @@ def get_friends(
 ):
     """
     Получить список друзей текущего пользователя.
-    По умолчанию возвращает только видимых друзей (hidden=False).
-    Если show_hidden=True — покажет скрытых друзей.
+    В поле "user" будет именно профиль друга (friend_id), а не твой собственный!
     """
     query = db.query(Friend).filter(Friend.user_id == current_user.id)
     if show_hidden is not None:
         query = query.filter(Friend.hidden == show_hidden)
     friends = query.all()
-    return friends
+
+    # Формируем результат вручную: "user" — всегда твой друг!
+    result = []
+    for friend in friends:
+        friend_profile = db.query(User).filter(User.id == friend.friend_id).first()
+        result.append({
+            "id": friend.id,
+            "user": {
+                "id": friend_profile.id,
+                "first_name": friend_profile.first_name,
+                "last_name": friend_profile.last_name,
+                "username": friend_profile.username,
+                "photo_url": friend_profile.photo_url
+            },
+            "created_at": friend.created_at,
+            "updated_at": friend.updated_at,
+            "hidden": friend.hidden
+        })
+    return result
+
 
 @router.post("/invite", response_model=FriendInviteOut)
 def create_invite(
