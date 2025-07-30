@@ -3,14 +3,18 @@
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session, joinedload
 from typing import List
+import secrets
 from src.db import get_db
 from src.models.group import Group
 from src.models.group_member import GroupMember
+from src.models.group_invite import GroupInvite
 from src.models.user import User
 from src.models.transaction import Transaction
 from src.schemas.group import GroupCreate, GroupOut
+from src.schemas.group_invite import GroupInviteOut
 from src.utils.balance import calculate_group_balances, greedy_settle_up
 from src.schemas.settlement import SettlementOut
+from src.utils.telegram_dep import get_current_telegram_user
 
 router = APIRouter()
 
@@ -110,3 +114,55 @@ def group_detail(group_id: int, db: Session = Depends(get_db)):
     if not group:
         raise HTTPException(status_code=404, detail="Группа не найдена")
     return group
+
+
+#РОУТЫ ДЛЯ инвайтов в группе
+@router.post("/{group_id}/invite", response_model=GroupInviteOut)
+def create_group_invite(
+    group_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_telegram_user)
+):
+    """
+    Создать (или получить существующий) инвайт для приглашения в группу.
+    """
+    # Проверяем, что такая группа есть
+    group = db.query(Group).filter(Group.id == group_id).first()
+    if not group:
+        raise HTTPException(status_code=404, detail="Группа не найдена")
+    # Пробуем найти уже существующий инвайт для этой группы
+    invite = db.query(GroupInvite).filter(GroupInvite.group_id == group_id).first()
+    if not invite:
+        # Генерируем токен
+        token = secrets.token_urlsafe(16)
+        invite = GroupInvite(group_id=group_id, token=token)
+        db.add(invite)
+        db.commit()
+        db.refresh(invite)
+    return invite
+
+@router.post("/accept-invite")
+def accept_group_invite(
+    token: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_telegram_user)
+):
+    """
+    Добавить текущего пользователя в группу по инвайт-токену.
+    """
+    invite = db.query(GroupInvite).filter(GroupInvite.token == token).first()
+    if not invite:
+        raise HTTPException(status_code=404, detail="Инвайт не найден")
+    group_id = invite.group_id
+    # Проверяем, состоит ли уже пользователь в группе
+    already_member = db.query(GroupMember).filter(
+        GroupMember.group_id == group_id,
+        GroupMember.user_id == current_user.id
+    ).first()
+    if already_member:
+        return {"detail": "Пользователь уже состоит в группе"}
+    # Добавляем пользователя в группу
+    new_member = GroupMember(group_id=group_id, user_id=current_user.id)
+    db.add(new_member)
+    db.commit()
+    return {"detail": "Успешно добавлен в группу"}

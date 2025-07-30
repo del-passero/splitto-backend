@@ -28,6 +28,7 @@ from src.models import (
     group_member,
     transaction,
     transaction_share,
+    group_invite,
     # если будут новые модели — обязательно допиши сюда!
 )
 

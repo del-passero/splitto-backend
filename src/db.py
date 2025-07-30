@@ -10,7 +10,19 @@ engine = create_engine(DATABASE_URL)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
-from src.models import expense_category, transaction, transaction_share, user, group, group_member, friend
+from src.models import (
+    expense_category,
+    transaction,
+    transaction_share,
+    user,
+    group,
+    group_member,
+    friend,
+    group_invite,
+    friend_invite,
+    invite_usage,
+    event,
+)
 
 
 
