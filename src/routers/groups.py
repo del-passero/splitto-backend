@@ -13,6 +13,7 @@ from src.models.user import User
 from src.models.transaction import Transaction
 from src.schemas.group import GroupCreate, GroupOut
 from src.schemas.group_invite import GroupInviteOut
+from src.schemas.group_member import GroupMemberOut 
 from src.utils.balance import calculate_group_balances, greedy_settle_up
 from src.schemas.settlement import SettlementOut
 from src.utils.telegram_dep import get_current_telegram_user
@@ -108,22 +109,28 @@ def get_groups(db: Session = Depends(get_db)):
 
 @router.get("/user/{user_id}")
 def get_groups_for_user(user_id: int, db: Session = Depends(get_db)):
-    """
-    Получить список всех групп, в которых состоит указанный пользователь (user_id).
-    Для каждой группы возвращается количество участников (members_count), которое считается по таблице group_members.
-    """
     group_ids = db.query(GroupMember.group_id).filter(GroupMember.user_id == user_id).subquery()
     groups = db.query(Group).filter(Group.id.in_(group_ids)).all()
     result = []
     for group in groups:
-        members = db.query(GroupMember).filter(GroupMember.group_id == group.id).all()
+        # Получаем первых 4-х участников (включая owner в начале, если его нет)
+        members = db.query(GroupMember).filter(GroupMember.group_id == group.id).limit(4).all()
+        # сериализация
+        member_objs = [GroupMemberOut.from_orm(m) for m in members]
         member_ids = set([m.user_id for m in members])
+        member_ids.add(group.owner_id)
+        # вставляем owner в начало, если он есть среди участников
+        owner_member = next((m for m in member_objs if m.user.id == group.owner_id), None)
+        if owner_member:
+            member_objs.remove(owner_member)
+            member_objs = [owner_member] + member_objs
         result.append({
             "id": group.id,
             "name": group.name,
             "description": group.description,
             "owner_id": group.owner_id,
-            "members_count": len(member_ids)
+            "members_count": len(member_ids),
+            "preview_members": member_objs  # <--- новое поле!
         })
     return result
 
