@@ -14,5 +14,5 @@ class GroupOut(BaseModel):
     owner_id: Optional[int]
     members: List[GroupMemberOut] = []      # <<< Ключевая строка!
     class Config:
-        orm_mode = True
+        from_attributes = True
 

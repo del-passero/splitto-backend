@@ -10,4 +10,4 @@ class GroupMemberOut(BaseModel):
     group_id: int
     user: UserOut              # <<< Вот это ключевое изменение!
     class Config:
-        orm_mode = True
+        from_attributes = True
