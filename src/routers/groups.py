@@ -129,13 +129,13 @@ def get_groups_for_user(user_id: int, db: Session = Depends(get_db)):
 
 @router.get("/{group_id}/detail/", response_model=GroupOut)
 def group_detail(group_id: int, db: Session = Depends(get_db)):
-    """
-    Получить подробную информацию о конкретной группе по её ID.
-    """
     group = db.query(Group).filter(Group.id == group_id).first()
     if not group:
         raise HTTPException(status_code=404, detail="Группа не найдена")
+    # ЯВНО ПОДГРУЖАЕМ УЧАСТНИКОВ!
+    group.members = db.query(GroupMember).filter(GroupMember.group_id == group_id).all()
     return group
+
 
 # =====================
 # Роуты для управления инвайтами (приглашениями) в группу
