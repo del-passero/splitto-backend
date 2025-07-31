@@ -137,6 +137,7 @@ def group_detail(group_id: int, db: Session = Depends(get_db)):
     return group
 
 
+
 # =====================
 # Роуты для управления инвайтами (приглашениями) в группу
 # =====================

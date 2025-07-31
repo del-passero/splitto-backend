@@ -1,5 +1,6 @@
 from pydantic import BaseModel
-from typing import Optional
+from typing import Optional, List
+from .group_member import GroupMemberOut    # Импорт схемы участника!
 
 class GroupCreate(BaseModel):
     name: str
@@ -11,5 +12,7 @@ class GroupOut(BaseModel):
     name: str
     description: str
     owner_id: Optional[int]
+    members: List[GroupMemberOut] = []      # <<< Ключевая строка!
     class Config:
         orm_mode = True
+
