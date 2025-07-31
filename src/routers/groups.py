@@ -132,7 +132,7 @@ def group_detail(group_id: int, db: Session = Depends(get_db)):
     group = db.query(Group).filter(Group.id == group_id).first()
     if not group:
         raise HTTPException(status_code=404, detail="Группа не найдена")
-    # ЯВНО ПОДГРУЖАЕМ УЧАСТНИКОВ
+    # ЯВНО ПОДГРУЖАЕМ УЧАСТНИКОВ!!!
     group.members = db.query(GroupMember).filter(GroupMember.group_id == group_id).all()
     return group
 
