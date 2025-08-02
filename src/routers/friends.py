@@ -1,8 +1,6 @@
-# src/routers/friends.py
-
-from fastapi import APIRouter, Depends, HTTPException, Body
+from fastapi import APIRouter, Depends, HTTPException, Body, Query
 from sqlalchemy.orm import Session
-from typing import List, Optional
+from typing import List, Optional, Union
 from src.db import get_db
 from src.models.user import User
 from src.models.friend import Friend
@@ -19,24 +17,32 @@ from datetime import datetime
 
 router = APIRouter(tags=["Друзья"])  # ← Только tags, prefix убран
 
-@router.get("/", response_model=List[FriendOut])
+@router.get("/", response_model=Union[List[FriendOut], dict])
 def get_friends(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_telegram_user),
-    show_hidden: Optional[bool] = False
+    show_hidden: Optional[bool] = False,
+    offset: int = Query(0, ge=0),
+    limit: Optional[int] = Query(None, gt=0),
 ):
     """
     Получить список друзей текущего пользователя.
-    В поле "user" будет профиль друга, в поле "friend" — твой профиль.
+    - Если не указаны offset/limit — возвращает весь список (старое поведение).
+    - Если указаны — возвращает {"total": ..., "friends": [...]} (новое поведение для фронта с пагинацией).
+    В поле "user" — профиль друга, в поле "friend" — твой профиль.
     """
     query = db.query(Friend).filter(Friend.user_id == current_user.id)
     if show_hidden is not None:
         query = query.filter(Friend.hidden == show_hidden)
-    friends = query.all()
+    total = query.count()
+
+    if limit is not None:
+        friends = query.offset(offset).limit(limit).all()
+    else:
+        friends = query.all()
 
     result = []
     for friend in friends:
-        # Получаем объект друга
         friend_profile = db.query(User).filter(User.id == friend.friend_id).first()
         result.append(
             FriendOut(
@@ -50,7 +56,13 @@ def get_friends(
                 friend=UserOut.from_orm(current_user)
             )
         )
-    return result
+
+    if limit is not None:
+        # Новое поведение: возврат с total (для фронта)
+        return {"total": total, "friends": result}
+    else:
+        # Старое поведение (для обратной совместимости)
+        return result
 
 @router.post("/invite", response_model=FriendInviteOut)
 def create_invite(

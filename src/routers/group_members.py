@@ -1,6 +1,5 @@
 # src/routers/group_members.py
-
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 from src.models.group_member import GroupMember
 from src.models.friend import Friend
@@ -8,7 +7,7 @@ from src.schemas.group_member import GroupMemberCreate, GroupMemberOut
 from src.db import get_db
 from src.models.user import User
 
-from typing import List
+from typing import List, Optional, Union
 
 router = APIRouter()
 
@@ -51,19 +50,48 @@ def add_group_member(member: GroupMemberCreate, db: Session = Depends(get_db)):
     add_mutual_friends_for_group(db, member.group_id)
     return db_member
 
-@router.get("/", response_model=List[GroupMemberOut])
-def get_group_members(db: Session = Depends(get_db)):
-    return db.query(GroupMember).all()
+@router.get("/", response_model=Union[List[GroupMemberOut], dict])
+def get_group_members(
+    db: Session = Depends(get_db),
+    offset: int = Query(0, ge=0),
+    limit: Optional[int] = Query(None, gt=0)
+):
+    """
+    Получить список всех участников (или пагинированно, если передан limit).
+    Если передан limit — вернётся {"total": ..., "items": [...]}
+    """
+    query = db.query(GroupMember)
+    total = query.count()
+    if limit is not None:
+        members = query.offset(offset).limit(limit).all()
+    else:
+        members = query.all()
+    items = [GroupMemberOut.from_orm(m) for m in members]
+    if limit is not None:
+        return {"total": total, "items": items}
+    else:
+        return items
 
-@router.get("/group/{group_id}")
-def get_members_for_group(group_id: int, db: Session = Depends(get_db)):
-    memberships = (
-        db.query(GroupMember, User)
-        .join(User, GroupMember.user_id == User.id)
+@router.get("/group/{group_id}", response_model=Union[List[dict], dict])
+def get_members_for_group(
+    group_id: int,
+    db: Session = Depends(get_db),
+    offset: int = Query(0, ge=0),
+    limit: Optional[int] = Query(None, gt=0)
+):
+    """
+    Получить участников конкретной группы (или пагинированно).
+    Если передан limit — вернётся {"total": ..., "items": [...]}
+    """
+    query = db.query(GroupMember, User)\
+        .join(User, GroupMember.user_id == User.id)\
         .filter(GroupMember.group_id == group_id)
-        .all()
-    )
-    return [
+    total = query.count()
+    if limit is not None:
+        memberships = query.offset(offset).limit(limit).all()
+    else:
+        memberships = query.all()
+    items = [
         {
             "id": gm.id,
             "group_id": gm.group_id,
@@ -75,6 +103,10 @@ def get_members_for_group(group_id: int, db: Session = Depends(get_db)):
         }
         for gm, u in memberships
     ]
+    if limit is not None:
+        return {"total": total, "items": items}
+    else:
+        return items
 
 @router.delete("/{member_id}", status_code=204)
 def delete_group_member(member_id: int, db: Session = Depends(get_db)):
