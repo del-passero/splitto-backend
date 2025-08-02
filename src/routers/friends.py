@@ -23,13 +23,12 @@ def get_friends(
     current_user: User = Depends(get_current_telegram_user),
     show_hidden: Optional[bool] = False,
     offset: int = Query(0, ge=0),
-    limit: Optional[int] = Query(None, gt=0),
+    limit: Optional[int] = Query(None, gt=0)
 ):
     """
     Получить список друзей текущего пользователя.
     - Если не указаны offset/limit — возвращает весь список (старое поведение).
     - Если указаны — возвращает {"total": ..., "friends": [...]} (новое поведение для фронта с пагинацией).
-    В поле "user" — профиль друга, в поле "friend" — твой профиль.
     """
     query = db.query(Friend).filter(Friend.user_id == current_user.id)
     if show_hidden is not None:
@@ -58,10 +57,8 @@ def get_friends(
         )
 
     if limit is not None:
-        # Новое поведение: возврат с total (для фронта)
         return {"total": total, "friends": result}
     else:
-        # Старое поведение (для обратной совместимости)
         return result
 
 @router.post("/invite", response_model=FriendInviteOut)
