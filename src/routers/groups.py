@@ -1,7 +1,7 @@
 # src/routers/groups.py
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy.orm import Session, joinedload, selectinload
+from sqlalchemy.orm import Session, joinedload
 from typing import List, Optional
 import secrets
 
@@ -14,31 +14,34 @@ from src.models.transaction import Transaction
 from src.schemas.group import GroupCreate, GroupOut
 from src.schemas.group_invite import GroupInviteOut
 from src.schemas.group_member import GroupMemberOut 
+from src.schemas.user import UserOut
 from src.utils.balance import calculate_group_balances, greedy_settle_up
 from src.schemas.settlement import SettlementOut
 from src.utils.telegram_dep import get_current_telegram_user
 
 router = APIRouter()
 
-# =====================
-# Вспомогательные функции для работы с группами
-# =====================
+# ===== Вспомогательные функции для работы с группами =====
 
 def get_group_or_404(db: Session, group_id: int) -> Group:
+    """Получить объект группы или кинуть 404"""
     group = db.query(Group).filter(Group.id == group_id).first()
     if not group:
         raise HTTPException(status_code=404, detail="Группа не найдена")
     return group
 
 def get_group_member_ids(db: Session, group_id: int) -> List[int]:
+    """Получить user_id всех участников группы одним запросом"""
     return [m.user_id for m in db.query(GroupMember.user_id).filter(GroupMember.group_id == group_id).all()]
 
 def get_group_transactions(db: Session, group_id: int) -> List[Transaction]:
+    """Получить все транзакции группы (с preload shares)"""
     return db.query(Transaction)\
         .filter(Transaction.group_id == group_id, Transaction.is_deleted == False)\
         .options(joinedload(Transaction.shares)).all()
 
 def add_member_to_group(db: Session, group_id: int, user_id: int):
+    """Добавить участника в группу, если его там нет"""
     exists = db.query(GroupMember).filter(
         GroupMember.group_id == group_id,
         GroupMember.user_id == user_id
@@ -49,8 +52,11 @@ def add_member_to_group(db: Session, group_id: int, user_id: int):
         db.commit()
         db.refresh(db_member)
 
+# ===== Основные роуты для управления группами и участниками =====
+
 @router.get("/{group_id}/balances")
 def get_group_balances(group_id: int, db: Session = Depends(get_db)):
+    """Посчитать баланс каждого участника группы"""
     member_ids = get_group_member_ids(db, group_id)
     transactions = get_group_transactions(db, group_id)
     net_balance = calculate_group_balances(transactions, member_ids)
@@ -61,6 +67,7 @@ def get_group_balances(group_id: int, db: Session = Depends(get_db)):
 
 @router.get("/{group_id}/settle-up", response_model=List[SettlementOut])
 def get_group_settle_up(group_id: int, db: Session = Depends(get_db)):
+    """Рассчитать оптимальные переводы для погашения долгов"""
     member_ids = get_group_member_ids(db, group_id)
     transactions = get_group_transactions(db, group_id)
     net_balance = calculate_group_balances(transactions, member_ids)
@@ -69,6 +76,7 @@ def get_group_settle_up(group_id: int, db: Session = Depends(get_db)):
 
 @router.post("/", response_model=GroupOut)
 def create_group(group: GroupCreate, db: Session = Depends(get_db)):
+    """Создать новую группу"""
     db_group = Group(name=group.name, description=group.description, owner_id=group.owner_id)
     db.add(db_group)
     db.commit()
@@ -78,6 +86,7 @@ def create_group(group: GroupCreate, db: Session = Depends(get_db)):
 
 @router.get("/", response_model=List[GroupOut])
 def get_groups(db: Session = Depends(get_db)):
+    """Вернуть все группы (лучше добавить пагинацию при большом количестве!)"""
     return db.query(Group).all()
 
 @router.get("/user/{user_id}")
@@ -89,17 +98,21 @@ def get_groups_for_user(
     """
     Получить список групп пользователя с превью участников (bulk-оптимизация!).
     """
+    # Получаем id групп пользователя
     group_ids = [row[0] for row in db.query(GroupMember.group_id).filter(GroupMember.user_id == user_id).all()]
     if not group_ids:
         return []
 
+    # Сразу получаем все группы одним запросом
     groups = db.query(Group).filter(Group.id.in_(group_ids)).all()
     group_id_set = set(g.id for g in groups)
 
+    # Сразу bulk-join всех участников этих групп с User
     members = db.query(GroupMember, User).join(User, GroupMember.user_id == User.id)\
         .filter(GroupMember.group_id.in_(group_id_set))\
         .all()
 
+    # Сгруппировать участников по group_id
     from collections import defaultdict
     members_by_group = defaultdict(list)
     for gm, user in members:
@@ -108,21 +121,12 @@ def get_groups_for_user(
     result = []
     for group in groups:
         group_members = members_by_group.get(group.id, [])
-        # === ВНИМАНИЕ! Здесь теперь полный user-объект ===
+        # Готовим preview_members через GroupMemberOut + UserOut (все поля user!)
         member_objs = [
-            GroupMemberOut.from_orm(gm).dict()
-            | {
-                "user": {
-                    "id": user.id,
-                    "first_name": user.first_name,
-                    "last_name": user.last_name,
-                    "username": user.username,
-                    "photo_url": user.photo_url,
-                    "telegram_id": user.telegram_id,
-                }
-            }
+            GroupMemberOut.from_orm(gm).dict() | {"user": UserOut.from_orm(user).dict()}
             for gm, user in group_members
         ]
+        # owner первым, остальные — по очереди
         member_objs_sorted = sorted(
             member_objs,
             key=lambda m: (m["user"]["id"] != group.owner_id, m["user"]["id"])
@@ -153,32 +157,21 @@ def group_detail(
     group = db.query(Group).filter(Group.id == group_id).first()
     if not group:
         raise HTTPException(status_code=404, detail="Группа не найдена")
-    # Загружаем участников группы одним bulk-запросом (можно с join на User, если нужно)
-    query = db.query(GroupMember, User).join(User, GroupMember.user_id == User.id).filter(GroupMember.group_id == group_id)
+    # Загружаем участников группы с join на User (в каждом member.user — все поля)
+    members_query = db.query(GroupMember).options(joinedload(GroupMember.user))
     if limit is not None:
-        memberships = query.offset(offset).limit(limit).all()
+        members = members_query.filter(GroupMember.group_id == group_id).offset(offset).limit(limit).all()
     else:
-        memberships = query.all()
-    # === Формируем участников с полным user-объектом ===
-    members = [
-        GroupMemberOut.from_orm(gm).dict()
-        | {
-            "user": {
-                "id": user.id,
-                "first_name": user.first_name,
-                "last_name": user.last_name,
-                "username": user.username,
-                "photo_url": user.photo_url,
-                "telegram_id": user.telegram_id,
-            }
-        }
-        for gm, user in memberships
-    ]
+        members = members_query.filter(GroupMember.group_id == group_id).all()
+    # Сохраняем в поле .members
     group.members = members
     return group
 
+# ===== Роуты для управления инвайтами (приглашениями) в группу =====
+
 @router.post("/{group_id}/invite", response_model=GroupInviteOut)
 def create_group_invite(group_id: int, db: Session = Depends(get_db), current_user: User = Depends(get_current_telegram_user)):
+    """Сгенерировать/вернуть инвайт на вступление в группу"""
     group = db.query(Group).filter(Group.id == group_id).first()
     if not group:
         raise HTTPException(status_code=404, detail="Группа не найдена")
@@ -193,6 +186,7 @@ def create_group_invite(group_id: int, db: Session = Depends(get_db), current_us
 
 @router.post("/accept-invite")
 def accept_group_invite(token: str, db: Session = Depends(get_db), current_user: User = Depends(get_current_telegram_user)):
+    """Принять инвайт на вступление в группу"""
     invite = db.query(GroupInvite).filter(GroupInvite.token == token).first()
     if not invite:
         raise HTTPException(status_code=404, detail="Инвайт не найден")
