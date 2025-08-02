@@ -115,7 +115,7 @@ def get_members_for_group(
         for gm, u in memberships
     ]
     if limit is not None:
-        return {"total": total, "members": items}
+        return {"total": total, "items": items}
     else:
         return items
 
