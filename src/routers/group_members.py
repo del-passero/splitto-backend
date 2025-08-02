@@ -14,26 +14,21 @@ router = APIRouter()
 def add_mutual_friends_for_group(db: Session, group_id: int):
     """
     Для всех участников группы создать двусторонние связи Friend (bulk-оптимизация!).
-    Теперь выбирает существующие связи одним запросом и не делает вложенные циклы.
     """
-    # Получаем все user_id участников группы
     member_ids = [m[0] for m in db.query(GroupMember.user_id).filter(GroupMember.group_id == group_id).all()]
     if not member_ids:
         return
 
-    # Bulk fetch: все существующие friend-связи в группе (user_id, friend_id)
     existing_links = db.query(Friend.user_id, Friend.friend_id).filter(
         Friend.user_id.in_(member_ids),
         Friend.friend_id.in_(member_ids)
     ).all()
     existing_set = set(existing_links)
 
-    # Сформируем все возможные уникальные пары (без повторов)
     to_create = []
     for i in range(len(member_ids)):
         for j in range(i + 1, len(member_ids)):
             a, b = member_ids[i], member_ids[j]
-            # Проверяем: если связи нет — добавляем двусторонне
             if (a, b) not in existing_set:
                 to_create.append(Friend(user_id=a, friend_id=b))
             if (b, a) not in existing_set:
@@ -45,10 +40,6 @@ def add_mutual_friends_for_group(db: Session, group_id: int):
 
 @router.post("/", response_model=GroupMemberOut)
 def add_group_member(member: GroupMemberCreate, db: Session = Depends(get_db)):
-    """
-    Добавить нового участника в группу.
-    После добавления автоматически добавить всем участникам группы друг друга в друзья (bulk).
-    """
     exists = db.query(GroupMember).filter(
         GroupMember.group_id == member.group_id,
         GroupMember.user_id == member.user_id
@@ -59,7 +50,6 @@ def add_group_member(member: GroupMemberCreate, db: Session = Depends(get_db)):
     db.add(db_member)
     db.commit()
     db.refresh(db_member)
-    # Bulk добавление друзей!
     add_mutual_friends_for_group(db, member.group_id)
     return db_member
 
@@ -69,10 +59,6 @@ def get_group_members(
     offset: int = Query(0, ge=0),
     limit: Optional[int] = Query(None, gt=0)
 ):
-    """
-    Получить список всех участников (или пагинированно).
-    Если передан limit — вернётся {"total": ..., "items": [...]}
-    """
     query = db.query(GroupMember)
     total = query.count()
     if limit is not None:
@@ -110,22 +96,22 @@ def get_members_for_group(
             "group_id": gm.group_id,
             "user": {
                 "id": u.id,
-                "name": u.name,
+                "first_name": u.first_name,
+                "last_name": u.last_name,
+                "username": u.username,
+                "photo_url": u.photo_url,
                 "telegram_id": u.telegram_id,
             }
         }
         for gm, u in memberships
     ]
     if limit is not None:
-        return {"total": total, "items": items}
+        return {"total": total, "members": items}
     else:
         return items
 
 @router.delete("/{member_id}", status_code=204)
 def delete_group_member(member_id: int, db: Session = Depends(get_db)):
-    """
-    Удалить участника из группы.
-    """
     member = db.query(GroupMember).filter(GroupMember.id == member_id).first()
     if not member:
         raise HTTPException(status_code=404, detail="Участник группы не найден")
