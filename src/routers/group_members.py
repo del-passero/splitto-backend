@@ -1,4 +1,5 @@
 # src/routers/group_members.py
+
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 from src.models.group_member import GroupMember
@@ -6,36 +7,48 @@ from src.models.friend import Friend
 from src.schemas.group_member import GroupMemberCreate, GroupMemberOut
 from src.db import get_db
 from src.models.user import User
-
 from typing import List, Optional, Union
 
 router = APIRouter()
 
 def add_mutual_friends_for_group(db: Session, group_id: int):
     """
-    Для всех участников группы создаёт двусторонние связи Friend (если ещё нет).
-    Использовать после добавления нового участника в группу.
+    Для всех участников группы создать двусторонние связи Friend (bulk-оптимизация!).
+    Теперь выбирает существующие связи одним запросом и не делает вложенные циклы.
     """
-    member_ids = [m.user_id for m in db.query(GroupMember).filter(GroupMember.group_id == group_id).all()]
+    # Получаем все user_id участников группы
+    member_ids = [m[0] for m in db.query(GroupMember.user_id).filter(GroupMember.group_id == group_id).all()]
+    if not member_ids:
+        return
+
+    # Bulk fetch: все существующие friend-связи в группе (user_id, friend_id)
+    existing_links = db.query(Friend.user_id, Friend.friend_id).filter(
+        Friend.user_id.in_(member_ids),
+        Friend.friend_id.in_(member_ids)
+    ).all()
+    existing_set = set(existing_links)
+
+    # Сформируем все возможные уникальные пары (без повторов)
+    to_create = []
     for i in range(len(member_ids)):
         for j in range(i + 1, len(member_ids)):
             a, b = member_ids[i], member_ids[j]
-            # Добавляем связь a <-> b двусторонне
-            for x, y in [(a, b), (b, a)]:
-                exists = db.query(Friend).filter(
-                    Friend.user_id == x, Friend.friend_id == y
-                ).first()
-                if not exists:
-                    db.add(Friend(user_id=x, friend_id=y))
-    db.commit()
+            # Проверяем: если связи нет — добавляем двусторонне
+            if (a, b) not in existing_set:
+                to_create.append(Friend(user_id=a, friend_id=b))
+            if (b, a) not in existing_set:
+                to_create.append(Friend(user_id=b, friend_id=a))
+
+    if to_create:
+        db.bulk_save_objects(to_create)
+        db.commit()
 
 @router.post("/", response_model=GroupMemberOut)
 def add_group_member(member: GroupMemberCreate, db: Session = Depends(get_db)):
     """
     Добавить нового участника в группу.
-    После добавления автоматически добавить всем участникам группы друг друга в друзья (двусторонне).
+    После добавления автоматически добавить всем участникам группы друг друга в друзья (bulk).
     """
-    # Проверка на существование такой записи
     exists = db.query(GroupMember).filter(
         GroupMember.group_id == member.group_id,
         GroupMember.user_id == member.user_id
@@ -46,7 +59,7 @@ def add_group_member(member: GroupMemberCreate, db: Session = Depends(get_db)):
     db.add(db_member)
     db.commit()
     db.refresh(db_member)
-    # --- КЛЮЧЕВОЕ: автодобавление всех участников друг другу в друзья! ---
+    # Bulk добавление друзей!
     add_mutual_friends_for_group(db, member.group_id)
     return db_member
 
@@ -57,7 +70,7 @@ def get_group_members(
     limit: Optional[int] = Query(None, gt=0)
 ):
     """
-    Получить список всех участников (или пагинированно, если передан limit).
+    Получить список всех участников (или пагинированно).
     Если передан limit — вернётся {"total": ..., "items": [...]}
     """
     query = db.query(GroupMember)
@@ -80,7 +93,7 @@ def get_members_for_group(
     limit: Optional[int] = Query(None, gt=0)
 ):
     """
-    Получить участников конкретной группы (или пагинированно).
+    Получить участников конкретной группы (bulk join на User!).
     Если передан limit — вернётся {"total": ..., "items": [...]}
     """
     query = db.query(GroupMember, User)\
@@ -110,6 +123,9 @@ def get_members_for_group(
 
 @router.delete("/{member_id}", status_code=204)
 def delete_group_member(member_id: int, db: Session = Depends(get_db)):
+    """
+    Удалить участника из группы.
+    """
     member = db.query(GroupMember).filter(GroupMember.id == member_id).first()
     if not member:
         raise HTTPException(status_code=404, detail="Участник группы не найден")
