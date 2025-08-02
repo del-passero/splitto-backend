@@ -1,48 +1,48 @@
+# src/routers/friends.py
+
 from fastapi import APIRouter, Depends, HTTPException, Body, Query
 from sqlalchemy.orm import Session
-from typing import List, Optional, Union
+from typing import List, Optional
 from src.db import get_db
 from src.models.user import User
 from src.models.friend import Friend
 from src.models.friend_invite import FriendInvite
 from src.models.invite_usage import InviteUsage
 from src.models.event import Event
-from src.schemas.friend import FriendOut, FriendCreate
+from src.schemas.friend import FriendOut
 from src.schemas.friend_invite import FriendInviteOut
-from src.schemas.invite_usage import InviteUsageOut
 from src.schemas.user import UserOut
 from src.utils.telegram_dep import get_current_telegram_user
 import secrets
 from datetime import datetime
 
-router = APIRouter(tags=["Друзья"])  # ← Только tags, prefix убран
+router = APIRouter(tags=["Друзья"])
 
-@router.get("/", response_model=Union[List[FriendOut], dict])
+@router.get("/", response_model=dict)
 def get_friends(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_telegram_user),
     show_hidden: Optional[bool] = False,
     offset: int = Query(0, ge=0),
-    limit: Optional[int] = Query(None, gt=0)
+    limit: int = Query(50, gt=0)
 ):
     """
-    Получить список друзей текущего пользователя.
-    - Если не указаны offset/limit — возвращает весь список (старое поведение).
-    - Если указаны — возвращает {"total": ..., "friends": [...]} (новое поведение для фронта с пагинацией).
+    Получить список друзей текущего пользователя (с пагинацией).
     """
     query = db.query(Friend).filter(Friend.user_id == current_user.id)
     if show_hidden is not None:
         query = query.filter(Friend.hidden == show_hidden)
     total = query.count()
+    friends = query.offset(offset).limit(limit).all()
 
-    if limit is not None:
-        friends = query.offset(offset).limit(limit).all()
-    else:
-        friends = query.all()
+    # Bulk fetch: оптимизация!
+    friend_ids = [friend.friend_id for friend in friends]
+    profiles = db.query(User).filter(User.id.in_(friend_ids)).all()
+    profiles_map = {u.id: u for u in profiles}
 
     result = []
     for friend in friends:
-        friend_profile = db.query(User).filter(User.id == friend.friend_id).first()
+        friend_profile = profiles_map.get(friend.friend_id)
         result.append(
             FriendOut(
                 id=friend.id,
@@ -56,10 +56,11 @@ def get_friends(
             )
         )
 
-    if limit is not None:
-        return {"total": total, "friends": result}
-    else:
-        return result
+    return {
+        "total": total,
+        "friends": result
+    }
+
 
 @router.post("/invite", response_model=FriendInviteOut)
 def create_invite(
@@ -93,15 +94,18 @@ def accept_invite(
     to_user_id = current_user.id
     if from_user_id == to_user_id:
         return {"success": True}
+    # Проверяем, не являются ли уже друзьями
     exists = db.query(Friend).filter(
         Friend.user_id == from_user_id,
         Friend.friend_id == to_user_id
     ).first()
     if not exists:
         now = datetime.utcnow()
+        # Двусторонняя связь дружбы
         db.add(Friend(user_id=from_user_id, friend_id=to_user_id, hidden=False, created_at=now, updated_at=now))
         db.add(Friend(user_id=to_user_id, friend_id=from_user_id, hidden=False, created_at=now, updated_at=now))
         db.commit()
+        # Логируем событие "добавлен друг"
         db.add(Event(
             actor_id=from_user_id,
             target_user_id=to_user_id,
@@ -115,6 +119,7 @@ def accept_invite(
             data=None
         ))
         db.commit()
+    # Отмечаем использование инвайта (и увеличиваем счетчик только при первом использовании)
     usage = db.query(InviteUsage).filter_by(user_id=to_user_id).first()
     if not usage:
         db.add(InviteUsage(invite_id=invite.id, user_id=to_user_id))
@@ -122,6 +127,7 @@ def accept_invite(
         if inviter:
             inviter.invited_friends_count += 1
             db.commit()
+        # Логируем событие "инвайт зарегистрирован"
         db.add(Event(
             actor_id=from_user_id,
             target_user_id=to_user_id,
@@ -152,6 +158,7 @@ def hide_friend(
     friend.hidden = True
     friend.updated_at = datetime.utcnow()
     db.commit()
+    # Логируем событие "друг скрыт"
     db.add(Event(
         actor_id=current_user.id,
         target_user_id=friend_id,
@@ -176,6 +183,7 @@ def unhide_friend(
     friend.hidden = False
     friend.updated_at = datetime.utcnow()
     db.commit()
+    # Логируем событие "друг восстановлен"
     db.add(Event(
         actor_id=current_user.id,
         target_user_id=friend_id,
@@ -206,4 +214,71 @@ def invite_stats(
             {"user_id": u.user_id, "used_at": u.used_at}
             for u in usages
         ]
+    }
+
+@router.get("/search", response_model=dict)
+def search_friends(
+    query: str = Query(..., min_length=1, description="Строка для поиска по имени/username"),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_telegram_user),
+    show_hidden: Optional[bool] = False,
+    offset: int = Query(0, ge=0),
+    limit: int = Query(50, gt=0)
+):
+    """
+    Поиск друзей по имени, username или фамилии (с пагинацией).
+    Bulk-оптимизация: загружает все Friend-связи одним запросом.
+    """
+    # Получаем friend_ids друзей текущего пользователя с фильтром hidden
+    friend_ids_query = db.query(Friend.friend_id).filter(Friend.user_id == current_user.id)
+    if show_hidden is not None:
+        friend_ids_query = friend_ids_query.filter(Friend.hidden == show_hidden)
+    friend_ids = [row[0] for row in friend_ids_query]
+
+    # Поиск пользователей среди друзей (bulk)
+    search_query = db.query(User).filter(
+        User.id.in_(friend_ids),
+        (
+            User.username.ilike(f"%{query}%") |
+            User.first_name.ilike(f"%{query}%") |
+            User.last_name.ilike(f"%{query}%")
+        )
+    )
+    total = search_query.count()
+    users = search_query.offset(offset).limit(limit).all()
+
+    # Bulk-оптимизация: загружаем все Friend-связи за один раз!
+    # Формируем map по user_id (friend_id)
+    if users:
+        user_ids = [u.id for u in users]
+        friend_links = db.query(Friend).filter(
+            Friend.user_id == current_user.id,
+            Friend.friend_id.in_(user_ids)
+        ).all()
+        friend_link_map = {f.friend_id: f for f in friend_links}
+    else:
+        friend_link_map = {}
+
+    result = []
+    for user in users:
+        friend_link = friend_link_map.get(user.id)
+        if not friend_link:
+            # Могут быть несогласованные данные, но такого почти не бывает
+            continue
+        result.append(
+            FriendOut(
+                id=friend_link.id,
+                user_id=friend_link.user_id,
+                friend_id=friend_link.friend_id,
+                created_at=friend_link.created_at,
+                updated_at=friend_link.updated_at,
+                hidden=friend_link.hidden,
+                user=UserOut.from_orm(user),
+                friend=UserOut.from_orm(current_user)
+            )
+        )
+
+    return {
+        "total": total,
+        "friends": result
     }
