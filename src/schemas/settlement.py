@@ -12,4 +12,4 @@ class SettlementOut(BaseModel):
     amount: float      # сумма перевода (>0, округляется до 2 знаков)
 
     class Config:
-        orm_mode = True
+        from_attributes = True

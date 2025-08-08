@@ -238,6 +238,7 @@ def get_groups_for_user(
 
     # 3) Сортировка по "активности":
     #    Берём max даты НЕ удалённых транзакций для каждой группы.
+    from sqlalchemy import cast, DateTime
     tx_dates_subq = (
         db.query(
             Transaction.group_id.label("g_id"),
@@ -251,7 +252,10 @@ def get_groups_for_user(
     q_groups = (
         q_groups.outerjoin(tx_dates_subq, tx_dates_subq.c.g_id == Group.id)
         .order_by(
-            func.coalesce(tx_dates_subq.c.last_tx_date, func.nullif(None, None)).desc().nullslast(),
+            func.coalesce(
+                tx_dates_subq.c.last_tx_date,
+                cast(None, DateTime)
+            ).desc().nullslast(),
             Group.archived_at.desc().nullslast(),
             Group.id.desc(),
         )
@@ -307,6 +311,7 @@ def get_groups_for_user(
         })
 
     return result
+
 
 
 @router.get("/{group_id}/detail/", response_model=GroupOut)
