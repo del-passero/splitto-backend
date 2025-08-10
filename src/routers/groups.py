@@ -463,7 +463,10 @@ def change_group_currency(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_telegram_user),
 ):
-    group = require_owner(db, group_id, current_user.id)
+    # раньше: require_owner(db, group_id, current_user.id)
+    require_membership(db, group_id, current_user.id)  # ← теперь любой участник
+
+    group = get_group_or_404(db, group_id)
     ensure_group_active(group)
 
     norm_code = code.upper().strip()
@@ -482,6 +485,7 @@ def change_group_currency(
 
     group.default_currency_code = norm_code
     db.commit()
+
 
 
 # ===== Расписание (end_date / auto_archive) =====
