@@ -171,22 +171,20 @@ def get_groups_for_user(
     members_preview_limit: int = Query(4, gt=0),
     include_hidden: bool = Query(False, description="Включать персонально скрытые группы"),
     include_archived: bool = Query(False, description="Включать архивные группы"),
-    limit: int = Query(20, ge=1, le=200),
-    offset: int = Query(0, ge=0),
+    limit: int = Query(20, ge=1, le=200, description="Сколько групп вернуть"),
+    offset: int = Query(0, ge=0, description="Смещение для пагинации"),
     q: Optional[str] = Query(None, description="Поиск по названию/описанию"),
 ):
     if user_id != current_user.id:
         raise HTTPException(status_code=403, detail="Forbidden")
 
     # 1) id групп пользователя
-    user_group_ids = [
-        gid for (gid,) in db.query(GroupMember.group_id).filter(GroupMember.user_id == user_id).all()
-    ]
+    user_group_ids = [gid for (gid,) in db.query(GroupMember.group_id).filter(GroupMember.user_id == user_id).all()]
     if not user_group_ids:
         response.headers["X-Total-Count"] = "0"
         return []
 
-    # 2) БАЗОВЫЙ ЗАПРОС С ФИЛЬТРАМИ (БЕЗ join'ов!) — ДЛЯ total
+    # 2) БАЗОВЫЙ запрос с фильтрами (БЕЗ join'ов и order_by) — для корректного total
     base_q = db.query(Group).filter(
         Group.id.in_(user_group_ids),
         Group.deleted_at.is_(None),
@@ -204,11 +202,14 @@ def get_groups_for_user(
         like = f"%{q.strip()}%"
         base_q = base_q.filter((Group.name.ilike(like)) | (Group.description.ilike(like)))
 
-    # total считаем СЕЙЧАС — из base_q (без внешних join'ов и order_by)
+    # 3) total СЧИТАЕМ ИМЕННО ИЗ base_q
     total = base_q.count()
     response.headers["X-Total-Count"] = str(int(total))
 
-    # 3) ДОП. сортировка по "активности" + пагинация для items
+    # 4) Сортировка по "активности" + пагинация — только для items
+    from sqlalchemy import func, cast
+    from sqlalchemy.sql.sqltypes import DateTime
+
     tx_dates_subq = (
         db.query(
             Transaction.group_id.label("g_id"),
@@ -219,7 +220,7 @@ def get_groups_for_user(
         .subquery()
     )
 
-    page_q = (
+    page_groups = (
         base_q.outerjoin(tx_dates_subq, tx_dates_subq.c.g_id == Group.id)
         .order_by(
             func.coalesce(tx_dates_subq.c.last_tx_date, cast(None, DateTime)).desc().nullslast(),
@@ -228,14 +229,14 @@ def get_groups_for_user(
         )
         .limit(limit)
         .offset(offset)
+        .all()
     )
-    page_groups = page_q.all()
     if not page_groups:
         return []
 
     page_group_ids = {g.id for g in page_groups}
 
-    # 4) превью участников (как раньше)
+    # 5) превью участников
     members = (
         db.query(GroupMember, User)
         .join(User, GroupMember.user_id == User.id)
@@ -249,11 +250,12 @@ def get_groups_for_user(
 
     result = []
     for group in page_groups:
-        group_members = members_by_group.get(group.id, [])
+        gm_list = members_by_group.get(group.id, [])
         member_objs = [
             GroupMemberOut.from_orm(gm).dict() | {"user": UserOut.from_orm(user).dict()}
-            for gm, user in group_members
+            for gm, user in gm_list
         ]
+        # владелец — первым
         member_objs_sorted = sorted(
             member_objs,
             key=lambda m: (m["user"]["id"] != group.owner_id, m["user"]["id"])
@@ -271,6 +273,7 @@ def get_groups_for_user(
         })
 
     return result
+
 
 
 # ===== Детали группы =====
