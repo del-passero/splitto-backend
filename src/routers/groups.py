@@ -10,6 +10,7 @@
 #   • Архивация/разархивация — глобально, только если нет долгов.
 #   • Soft-delete/restore — только если нет долгов.
 #   • Смена валюты группы (PATCH currency) — владелец, если в группе нет транзакций.
+#   • РАСПИСАНИЕ: PATCH schedule (end_date/auto_archive) — владелец, только для активной группы.
 #
 # Важно:
 #   • Мы НЕ удаляем старое поведение, только усиливаем и добавляем опции.
@@ -24,13 +25,14 @@
 from __future__ import annotations
 
 from typing import List, Optional
-from datetime import datetime
+from datetime import datetime, date
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from starlette import status
 from sqlalchemy.orm import Session, joinedload
 from sqlalchemy import func, select, cast
 from sqlalchemy.sql.sqltypes import DateTime
+from pydantic import BaseModel
 
 from src.db import get_db
 from src.models.group import Group, GroupStatus
@@ -207,9 +209,6 @@ def get_groups_for_user(
     response.headers["X-Total-Count"] = str(int(total))
 
     # 4) Сортировка по "активности" + пагинация — только для items
-    from sqlalchemy import func, cast
-    from sqlalchemy.sql.sqltypes import DateTime
-
     tx_dates_subq = (
         db.query(
             Transaction.group_id.label("g_id"),
@@ -483,3 +482,55 @@ def change_group_currency(
 
     group.default_currency_code = norm_code
     db.commit()
+
+
+# ===== Расписание (end_date / auto_archive) =====
+
+class GroupScheduleUpdate(BaseModel):
+    end_date: Optional[date] = None
+    auto_archive: Optional[bool] = None
+
+@router.patch("/{group_id}/schedule", response_model=GroupOut)
+def update_group_schedule(
+    group_id: int,
+    payload: GroupScheduleUpdate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_telegram_user),
+):
+    """
+    Обновление плановой даты окончания и флага авто-архивации.
+    Доступ: только владелец. Только для активной группы.
+    Валидация:
+      • если end_date задана — она должна быть >= сегодняшней даты;
+      • если end_date очищена (null) — auto_archive автоматически сбрасывается в False.
+    """
+    group = require_owner(db, group_id, current_user.id)
+    ensure_group_active(group)
+
+    # Определяем, какие поля реально прислали (pydantic v1/v2 совместимость)
+    fields_set = getattr(payload, "__fields_set__", getattr(payload, "model_fields_set", set()))
+
+    # 1) Изменение даты
+    if "end_date" in fields_set:
+        if payload.end_date is None:
+            # очищаем дату и принудительно выключаем автоархив
+            group.end_date = None
+            group.auto_archive = False
+        else:
+            # простая валидация: дата не в прошлом
+            today = date.today()
+            if payload.end_date < today:
+                raise HTTPException(status_code=422, detail="end_date must be today or later")
+            group.end_date = payload.end_date
+
+    # 2) Изменение флага auto_archive
+    if "auto_archive" in fields_set:
+        # если дата очищена или отсутствует — форсим False
+        if group.end_date is None:
+            group.auto_archive = False
+        else:
+            group.auto_archive = bool(payload.auto_archive)
+
+    db.commit()
+    db.refresh(group)
+    return group
