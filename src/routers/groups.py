@@ -14,16 +14,12 @@
 # Важно:
 #   • Мы НЕ удаляем старое поведение, только усиливаем и добавляем опции.
 #   • Новый порядок в /groups/user/{user_id}:
-#       - фильтры (deleted/hidden/archived),
-#       - считаем total,
+#       - фильтры (deleted/hidden/archived + q по name/description),
+#       - считаем total из БАЗОВОГО запроса (без join'ов),
 #       - сортируем по last_activity (max(tx.date) DESC NULLS LAST, затем archived_at DESC, затем id DESC),
 #       - применяем limit/offset,
 #       - собираем превью участников так же, как раньше.
 #   • В ответ /groups/user/{user_id} добавлен заголовок `X-Total-Count` (тело НЕ меняем).
-#
-# Примечание:
-#   • Код зависит от новых полей модели Group (status/archived_at/deleted_at/...) и новых таблиц group_hidden/currencies.
-#     Мы договорились применить миграции В КОНЦЕ — до миграций приложение не запускать.
 
 from __future__ import annotations
 
@@ -33,7 +29,8 @@ from datetime import datetime
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from starlette import status
 from sqlalchemy.orm import Session, joinedload
-from sqlalchemy import func, select
+from sqlalchemy import func, select, cast
+from sqlalchemy.sql.sqltypes import DateTime
 
 from src.db import get_db
 from src.models.group import Group, GroupStatus
@@ -41,16 +38,15 @@ from src.models.group_member import GroupMember
 from src.models.group_invite import GroupInvite
 from src.models.user import User
 from src.models.transaction import Transaction
-from src.models.group_hidden import GroupHidden                # NEW: персональное скрытие
-from src.models.currency import Currency                       # NEW: справочник валют
+from src.models.group_hidden import GroupHidden
+from src.models.currency import Currency
 from src.schemas.group import GroupCreate, GroupOut
 from src.schemas.group_invite import GroupInviteOut
 from src.schemas.group_member import GroupMemberOut
 from src.schemas.user import UserOut
-from src.utils.balance import calculate_group_balances, greedy_settle_up
 from src.schemas.settlement import SettlementOut
-from src.utils.telegram_dep import get_current_telegram_user         # ⚠️ импорт зависимости авторизации (Telegram WebApp)
-# Общие гарды/утилиты по группам
+from src.utils.balance import calculate_group_balances, greedy_settle_up
+from src.utils.telegram_dep import get_current_telegram_user
 from src.utils.groups import (
     require_membership,
     require_owner,
@@ -63,32 +59,27 @@ import secrets
 router = APIRouter()
 
 
-# ===== Старые вспомогательные функции (оставляем для совместимости) =====
+# ===== Вспомогательные =====
 
 def get_group_or_404(db: Session, group_id: int) -> Group:
-    """
-    Получить объект группы или кинуть 404.
-    NEW: игнорируем soft-deleted записи (deleted_at IS NULL).
-    """
-    group = db.query(Group).filter(Group.id == group_id, Group.deleted_at.is_(None)).first()
+    group = (
+        db.query(Group)
+        .filter(Group.id == group_id, Group.deleted_at.is_(None))
+        .first()
+    )
     if not group:
         raise HTTPException(status_code=404, detail="Группа не найдена")
     return group
 
 
 def get_group_member_ids(db: Session, group_id: int) -> List[int]:
-    """
-    Получить user_id всех участников группы одним запросом.
-    (Оставляем старую функцию; она используется в расчётах балансов/settle-up.)
-    """
-    return [m.user_id for m in db.query(GroupMember.user_id).filter(GroupMember.group_id == group_id).all()]
+    return [
+        m.user_id
+        for m in db.query(GroupMember.user_id).filter(GroupMember.group_id == group_id).all()
+    ]
 
 
 def get_group_transactions(db: Session, group_id: int) -> List[Transaction]:
-    """
-    Получить все НЕ удалённые транзакции группы (с preload shares).
-    (Оставляем старую функцию; она используется в расчётах балансов/settle-up.)
-    """
     return (
         db.query(Transaction)
         .filter(Transaction.group_id == group_id, Transaction.is_deleted == False)
@@ -98,10 +89,6 @@ def get_group_transactions(db: Session, group_id: int) -> List[Transaction]:
 
 
 def add_member_to_group(db: Session, group_id: int, user_id: int):
-    """
-    Добавить участника в группу, если его там нет.
-    (Оставляем старый помощник, без изменений.)
-    """
     exists = db.query(GroupMember).filter(
         GroupMember.group_id == group_id,
         GroupMember.user_id == user_id
@@ -119,11 +106,9 @@ def add_member_to_group(db: Session, group_id: int, user_id: int):
 def get_group_balances(
     group_id: int,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_telegram_user),  # NEW: требуем авторизацию и членство
+    current_user: User = Depends(get_current_telegram_user),
 ):
-    """Посчитать баланс каждого участника группы (только участник группы)."""
     require_membership(db, group_id, current_user.id)
-
     member_ids = get_group_member_ids(db, group_id)
     transactions = get_group_transactions(db, group_id)
     net_balance = calculate_group_balances(transactions, member_ids)
@@ -137,11 +122,9 @@ def get_group_balances(
 def get_group_settle_up(
     group_id: int,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_telegram_user),  # NEW: проверяем членство
+    current_user: User = Depends(get_current_telegram_user),
 ):
-    """Рассчитать оптимальные переводы для погашения долгов (только участник группы)."""
     require_membership(db, group_id, current_user.id)
-
     member_ids = get_group_member_ids(db, group_id)
     transactions = get_group_transactions(db, group_id)
     net_balance = calculate_group_balances(transactions, member_ids)
@@ -149,15 +132,10 @@ def get_group_settle_up(
     return settlements
 
 
-# ===== Создание и списки групп =====
+# ===== Создание и базовые списки =====
 
 @router.post("/", response_model=GroupOut)
 def create_group(group: GroupCreate, db: Session = Depends(get_db)):
-    """
-    Создать новую группу.
-    СТАРОЕ ПОВЕДЕНИЕ: берём name/description/owner_id из тела.
-    NEW: после миграций у модели появится default_currency_code (дефолт 'RUB' для старых групп выставим миграцией).
-    """
     db_group = Group(name=group.name, description=group.description, owner_id=group.owner_id)
     db.add(db_group)
     db.commit()
@@ -169,22 +147,20 @@ def create_group(group: GroupCreate, db: Session = Depends(get_db)):
 @router.get("/", response_model=List[GroupOut])
 def get_groups(
     db: Session = Depends(get_db),
-    limit: int = Query(100, ge=1, le=500, description="Сколько групп вернуть"),
-    offset: int = Query(0, ge=0, description="Смещение"),
+    limit: int = Query(100, ge=1, le=500),
+    offset: int = Query(0, ge=0),
 ):
-    """
-    Вернуть список групп (по умолчанию исключаем soft-deleted).
-    NEW: добавлены limit/offset, сортировка по id DESC (стабильный и простой порядок).
-    """
-    q = (
+    return (
         db.query(Group)
         .filter(Group.deleted_at.is_(None))
         .order_by(Group.id.desc())
         .limit(limit)
         .offset(offset)
+        .all()
     )
-    return q.all()
 
+
+# ===== Группы пользователя (ПАГИНАЦИЯ + поиск + X-Total-Count) =====
 
 @router.get("/user/{user_id}")
 def get_groups_for_user(
@@ -195,42 +171,44 @@ def get_groups_for_user(
     members_preview_limit: int = Query(4, gt=0),
     include_hidden: bool = Query(False, description="Включать персонально скрытые группы"),
     include_archived: bool = Query(False, description="Включать архивные группы"),
-    limit: int = Query(20, ge=1, le=200, description="Сколько групп вернуть"),
-    offset: int = Query(0, ge=0, description="Смещение для пагинации"),
+    limit: int = Query(20, ge=1, le=200),
+    offset: int = Query(0, ge=0),
     q: Optional[str] = Query(None, description="Поиск по названию/описанию"),
 ):
     if user_id != current_user.id:
         raise HTTPException(status_code=403, detail="Forbidden")
 
     # 1) id групп пользователя
-    user_group_ids = [gid for (gid,) in db.query(GroupMember.group_id).filter(GroupMember.user_id == user_id).all()]
+    user_group_ids = [
+        gid for (gid,) in db.query(GroupMember.group_id).filter(GroupMember.user_id == user_id).all()
+    ]
     if not user_group_ids:
         response.headers["X-Total-Count"] = "0"
         return []
 
-    # 2) базовый запрос + фильтры
-    q_groups = db.query(Group).filter(
+    # 2) БАЗОВЫЙ ЗАПРОС С ФИЛЬТРАМИ (БЕЗ join'ов!) — ДЛЯ total
+    base_q = db.query(Group).filter(
         Group.id.in_(user_group_ids),
         Group.deleted_at.is_(None),
     )
     if not include_archived:
-        q_groups = q_groups.filter(Group.status == GroupStatus.active)
+        base_q = base_q.filter(Group.status == GroupStatus.active)
 
     if not include_hidden:
-        q_groups = q_groups.outerjoin(
+        base_q = base_q.outerjoin(
             GroupHidden,
             (GroupHidden.group_id == Group.id) & (GroupHidden.user_id == user_id)
         ).filter(GroupHidden.user_id.is_(None))
 
-    # 2.1) ПОИСК: точная подстрока в name ИЛИ description
     if q:
         like = f"%{q.strip()}%"
-        q_groups = q_groups.filter(
-            (Group.name.ilike(like)) | (Group.description.ilike(like))
-        )
+        base_q = base_q.filter((Group.name.ilike(like)) | (Group.description.ilike(like)))
 
-    # 3) сортировка по "активности"
-    from sqlalchemy import cast, DateTime
+    # total считаем СЕЙЧАС — из base_q (без внешних join'ов и order_by)
+    total = base_q.count()
+    response.headers["X-Total-Count"] = str(int(total))
+
+    # 3) ДОП. сортировка по "активности" + пагинация для items
     tx_dates_subq = (
         db.query(
             Transaction.group_id.label("g_id"),
@@ -240,27 +218,24 @@ def get_groups_for_user(
         .group_by(Transaction.group_id)
         .subquery()
     )
-    q_groups = (
-        q_groups.outerjoin(tx_dates_subq, tx_dates_subq.c.g_id == Group.id)
+
+    page_q = (
+        base_q.outerjoin(tx_dates_subq, tx_dates_subq.c.g_id == Group.id)
         .order_by(
             func.coalesce(tx_dates_subq.c.last_tx_date, cast(None, DateTime)).desc().nullslast(),
             Group.archived_at.desc().nullslast(),
             Group.id.desc(),
         )
+        .limit(limit)
+        .offset(offset)
     )
-
-    # 4) total — СТРОГО после всех фильтров (user/hidden/archived/q)
-    total = db.query(func.count(func.distinct(Group.id))).select_from(q_groups.subquery()).scalar() or 0
-    response.headers["X-Total-Count"] = str(int(total))
-
-    # 5) страница
-    page_groups = q_groups.limit(limit).offset(offset).all()
+    page_groups = page_q.all()
     if not page_groups:
         return []
 
     page_group_ids = {g.id for g in page_groups}
 
-    # 6) превью участников
+    # 4) превью участников (как раньше)
     members = (
         db.query(GroupMember, User)
         .join(User, GroupMember.user_id == User.id)
@@ -298,7 +273,7 @@ def get_groups_for_user(
     return result
 
 
-
+# ===== Детали группы =====
 
 @router.get("/{group_id}/detail/", response_model=GroupOut)
 def group_detail(
@@ -308,16 +283,17 @@ def group_detail(
     offset: int = Query(0, ge=0),
     limit: Optional[int] = Query(None, gt=0)
 ):
-    """
-    Получить полную информацию о группе + участников (bulk-оптимизация, пагинация).
-    Детали можно смотреть участнику; архивная группа тоже доступна на чтение.
-    """
     group = get_group_or_404(db, group_id)
     require_membership(db, group_id, current_user.id)
 
     members_query = db.query(GroupMember).options(joinedload(GroupMember.user))
     if limit is not None:
-        members = members_query.filter(GroupMember.group_id == group_id).offset(offset).limit(limit).all()
+        members = (
+            members_query.filter(GroupMember.group_id == group_id)
+            .offset(offset)
+            .limit(limit)
+            .all()
+        )
     else:
         members = members_query.filter(GroupMember.group_id == group_id).all()
 
@@ -333,10 +309,6 @@ def create_group_invite(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_telegram_user)
 ):
-    """
-    Сгенерировать/вернуть инвайт на вступление в группу.
-    Требуется членство. Для archived/deleted — запрещено.
-    """
     group = require_membership(db, group_id, current_user.id)
     ensure_group_active(group)
 
@@ -356,10 +328,6 @@ def accept_group_invite(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_telegram_user)
 ):
-    """
-    Принять инвайт на вступление в группу.
-    Для archived/deleted групп — запрещено.
-    """
     invite = db.query(GroupInvite).filter(GroupInvite.token == token).first()
     if not invite:
         raise HTTPException(status_code=404, detail="Инвайт не найден")
@@ -374,13 +342,12 @@ def accept_group_invite(
 
 # ===== Персональное скрытие =====
 
-@router.post("/{group_id}/hide", status_code=status.HTTP_204_NO_CONTENT, summary="Скрыть группу для себя (персонально)")
+@router.post("/{group_id}/hide", status_code=status.HTTP_204_NO_CONTENT)
 def hide_group_for_me(
     group_id: int,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_telegram_user),
 ):
-    """Скрывает группу для текущего пользователя. Идемпотентно."""
     require_membership(db, group_id, current_user.id)
 
     exists = db.scalar(
@@ -396,13 +363,12 @@ def hide_group_for_me(
     db.commit()
 
 
-@router.post("/{group_id}/unhide", status_code=status.HTTP_204_NO_CONTENT, summary="Показать группу (снять персональное скрытие)")
+@router.post("/{group_id}/unhide", status_code=status.HTTP_204_NO_CONTENT)
 def unhide_group_for_me(
     group_id: int,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_telegram_user),
 ):
-    """Снимает персональное скрытие. Идемпотентно."""
     require_membership(db, group_id, current_user.id)
 
     row = db.query(GroupHidden).filter(
@@ -417,15 +383,12 @@ def unhide_group_for_me(
 
 # ===== Архивация (глобально) =====
 
-@router.post("/{group_id}/archive", status_code=status.HTTP_204_NO_CONTENT, summary="Архивировать группу (owner)")
+@router.post("/{group_id}/archive", status_code=status.HTTP_204_NO_CONTENT)
 def archive_group(
     group_id: int,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_telegram_user),
 ):
-    """
-    Архивирует группу для всех (read-only). Только владелец. Нельзя, если есть долги.
-    """
     group = require_owner(db, group_id, current_user.id)
     if group.status == GroupStatus.archived:
         return
@@ -437,13 +400,12 @@ def archive_group(
     db.commit()
 
 
-@router.post("/{group_id}/unarchive", status_code=status.HTTP_204_NO_CONTENT, summary="Разархивировать группу (owner)")
+@router.post("/{group_id}/unarchive", status_code=status.HTTP_204_NO_CONTENT)
 def unarchive_group(
     group_id: int,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_telegram_user),
 ):
-    """Возврат из archived в active. Только владелец."""
     group = require_owner(db, group_id, current_user.id)
     if group.status == GroupStatus.active:
         return
@@ -454,13 +416,12 @@ def unarchive_group(
 
 # ===== Soft-delete / Restore =====
 
-@router.delete("/{group_id}", status_code=status.HTTP_204_NO_CONTENT, summary="Soft-delete группы (owner)")
+@router.delete("/{group_id}", status_code=status.HTTP_204_NO_CONTENT)
 def soft_delete_group(
     group_id: int,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_telegram_user),
 ):
-    """Помечает группу как удалённую. Только владелец. Нельзя, если есть долги."""
     group = require_owner(db, group_id, current_user.id)
     if group.deleted_at is not None:
         return
@@ -471,16 +432,12 @@ def soft_delete_group(
     db.commit()
 
 
-@router.post("/{group_id}/restore", status_code=status.HTTP_204_NO_CONTENT, summary="Восстановить soft-deleted группу (owner)")
+@router.post("/{group_id}/restore", status_code=status.HTTP_204_NO_CONTENT)
 def restore_group(
     group_id: int,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_telegram_user),
 ):
-    """
-    Восстанавливает soft-deleted группу. По умолчанию переводим в 'archived'
-    (безопаснее, чем сразу 'active').
-    """
     group = db.query(Group).filter(Group.id == group_id).first()
     if not group:
         raise HTTPException(status_code=404, detail="Группа не найдена")
@@ -497,21 +454,13 @@ def restore_group(
 
 # ===== Смена валюты группы =====
 
-@router.patch("/{group_id}/currency", status_code=status.HTTP_204_NO_CONTENT, summary="Сменить валюту группы (owner, если нет транзакций)")
+@router.patch("/{group_id}/currency", status_code=status.HTTP_204_NO_CONTENT)
 def change_group_currency(
     group_id: int,
-    code: str = Query(..., min_length=3, max_length=3, description="ISO-4217 код валюты, напр. 'USD'"),
+    code: str = Query(..., min_length=3, max_length=3),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_telegram_user),
 ):
-    """
-    Меняет default_currency_code у группы.
-    Условия:
-      • только владелец,
-      • группа не archived/deleted,
-      • в группе нет транзакций (is_deleted=false),
-      • код валюты существует и активен в справочнике currencies.
-    """
     group = require_owner(db, group_id, current_user.id)
     ensure_group_active(group)
 
