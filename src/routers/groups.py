@@ -189,39 +189,26 @@ def get_groups(
 @router.get("/user/{user_id}")
 def get_groups_for_user(
     user_id: int,
-    response: Response,                                   # NEW: сюда положим X-Total-Count
+    response: Response,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_telegram_user),   # NEW: авторизация + защита от чужих запросов
+    current_user: User = Depends(get_current_telegram_user),
     members_preview_limit: int = Query(4, gt=0),
     include_hidden: bool = Query(False, description="Включать персонально скрытые группы"),
     include_archived: bool = Query(False, description="Включать архивные группы"),
     limit: int = Query(20, ge=1, le=200, description="Сколько групп вернуть"),
     offset: int = Query(0, ge=0, description="Смещение для пагинации"),
+    q: Optional[str] = Query(None, description="Поиск по названию/описанию"),
 ):
-    """
-    Получить список групп пользователя с превью участников (bulk-оптимизация!).
-    СТАРОЕ ПОВЕДЕНИЕ: формат ответа не меняем (кастомный dict).
-    NEW:
-      - Проверяем, что user_id == current_user.id (нельзя смотреть чужие группы).
-      - Фильтруем soft-deleted.
-      - По умолчанию исключаем персонально скрытые (GroupHidden), если include_hidden=false.
-      - По умолчанию исключаем архивные (status='archived'), если include_archived=false.
-      - Добавлена ПАГИНАЦИЯ (limit/offset) и сортировка по «активности»:
-          * max(Transaction.date) DESC NULLS LAST,
-          * затем Group.archived_at DESC NULLS LAST,
-          * затем Group.id DESC.
-      - В заголовок ответа добавляем X-Total-Count (total после фильтров).
-    """
     if user_id != current_user.id:
         raise HTTPException(status_code=403, detail="Forbidden")
 
-    # 1) Список групп, где пользователь — участник
+    # 1) id групп пользователя
     user_group_ids = [gid for (gid,) in db.query(GroupMember.group_id).filter(GroupMember.user_id == user_id).all()]
     if not user_group_ids:
         response.headers["X-Total-Count"] = "0"
         return []
 
-    # 2) Базовый запрос по группам с фильтрами (deleted/archived/hidden)
+    # 2) базовый запрос + фильтры
     q_groups = db.query(Group).filter(
         Group.id.in_(user_group_ids),
         Group.deleted_at.is_(None),
@@ -230,14 +217,19 @@ def get_groups_for_user(
         q_groups = q_groups.filter(Group.status == GroupStatus.active)
 
     if not include_hidden:
-        # LEFT JOIN на group_hidden и оставляем только те, где нет записи для current_user
         q_groups = q_groups.outerjoin(
             GroupHidden,
             (GroupHidden.group_id == Group.id) & (GroupHidden.user_id == user_id)
         ).filter(GroupHidden.user_id.is_(None))
 
-    # 3) Сортировка по "активности":
-    #    Берём max даты НЕ удалённых транзакций для каждой группы.
+    # 2.1) ПОИСК
+    if q:
+        like = f"%{q.strip()}%"
+        q_groups = q_groups.filter(
+            (Group.name.ilike(like)) | (Group.description.ilike(like))
+        )
+
+    # 3) сортировка по "активности"
     from sqlalchemy import cast, DateTime
     tx_dates_subq = (
         db.query(
@@ -248,32 +240,27 @@ def get_groups_for_user(
         .group_by(Transaction.group_id)
         .subquery()
     )
-    # Прим.: объединяемся с подзапросом; order by: last_tx_date desc NULLS LAST, archived_at desc NULLS LAST, id desc
     q_groups = (
         q_groups.outerjoin(tx_dates_subq, tx_dates_subq.c.g_id == Group.id)
         .order_by(
-            func.coalesce(
-                tx_dates_subq.c.last_tx_date,
-                cast(None, DateTime)
-            ).desc().nullslast(),
+            func.coalesce(tx_dates_subq.c.last_tx_date, cast(None, DateTime)).desc().nullslast(),
             Group.archived_at.desc().nullslast(),
             Group.id.desc(),
         )
     )
 
-    # 4) Подсчёт total (до limit/offset).
-    #    Из-за outer join корректнее считать по DISTINCT id.
+    # 4) total
     total = db.query(func.count(func.distinct(Group.id))).select_from(q_groups.subquery()).scalar() or 0
     response.headers["X-Total-Count"] = str(int(total))
 
-    # 5) Пагинация — применяем limit/offset ПОСЛЕ сортировки.
+    # 5) страница
     page_groups = q_groups.limit(limit).offset(offset).all()
     if not page_groups:
         return []
 
     page_group_ids = {g.id for g in page_groups}
 
-    # 6) Подтягиваем участников только для выбранных групп и «склеиваем» превью
+    # 6) превью участников
     members = (
         db.query(GroupMember, User)
         .join(User, GroupMember.user_id == User.id)
@@ -288,12 +275,10 @@ def get_groups_for_user(
     result = []
     for group in page_groups:
         group_members = members_by_group.get(group.id, [])
-        # Формируем те же структуры, что и раньше: GroupMemberOut + вложенный UserOut
         member_objs = [
             GroupMemberOut.from_orm(gm).dict() | {"user": UserOut.from_orm(user).dict()}
             for gm, user in group_members
         ]
-        # Владелец первым
         member_objs_sorted = sorted(
             member_objs,
             key=lambda m: (m["user"]["id"] != group.owner_id, m["user"]["id"])
@@ -311,6 +296,7 @@ def get_groups_for_user(
         })
 
     return result
+
 
 
 
