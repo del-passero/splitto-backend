@@ -16,7 +16,7 @@ load_dotenv()
 
 from src.db import engine  # инициализация БД/пула соединений
 
-# --- Импорт существующих роутеров (как в твоём файле) ---
+# --- Импорт существующих роутеров ---
 from src.routers.auth import router as auth_router
 from src.routers.users import router as users_router
 from src.routers.groups import router as groups_router
@@ -26,11 +26,11 @@ from src.routers.friends import router as friends_router
 from src.routers.events import router as events_router
 from src.routers.expense_categories import router as expense_categories_router
 
-# --- НОВОЕ: наши свежие роутеры ---
+# --- Новые роутеры ---
 from src.routers.currencies import router as currencies_router
 from src.routers.group_categories import router as group_categories_router
 
-# --- НОВОЕ: фоновая задача автоархива (включим флагом после миграций) ---
+# --- Фоновая задача автоархива (выключена по умолчанию) ---
 from src.jobs.auto_archive import start_auto_archive_loop
 
 app = FastAPI(
@@ -38,7 +38,7 @@ app = FastAPI(
     description="Backend для Splitto: авторизация через Telegram, пользователи, группы, транзакции и т.д.",
 )
 
-# --- CORS (оставлено как есть, дополнить домены при необходимости) ---
+# --- CORS ---
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -52,6 +52,7 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["X-Total-Count"],  # ← ВАЖНО: чтобы фронт видел total для пагинации
 )
 
 # --- Подключение роутеров ---
@@ -64,9 +65,7 @@ app.include_router(friends_router,          prefix="/api/friends",           tag
 app.include_router(events_router,           prefix="/api/events",            tags=["События"])
 app.include_router(expense_categories_router, prefix="/api/expense-categories", tags=["Категории расходов"])
 
-# НОВОЕ: словарь валют и категории группы
-#   • Роутер валют уже имеет prefix="/currencies" → общий префикс "/api" даст /api/currencies
-#   • Роутер категорий группы уже имеет prefix="/groups/{id}/categories" → общий "/api" даст нужный путь
+# Новые роутеры под общим /api
 app.include_router(currencies_router,       prefix="/api",                   tags=["Валюты"])
 app.include_router(group_categories_router, prefix="/api",                   tags=["Категории группы"])
 
@@ -75,12 +74,10 @@ def root():
     """Простой healthcheck."""
     return {"message": "Splitto backend работает!", "docs": "/docs"}
 
-# НОВОЕ: мягкий запуск фоновой задачи (выключено по умолчанию).
-# Включится только если выставить переменную окружения AUTO_ARCHIVE_ENABLED=1.
 @app.on_event("startup")
 def _startup_jobs():
     if os.getenv("AUTO_ARCHIVE_ENABLED") == "1":
-        # ВНИМАНИЕ: требуются миграции для полей Group (status/end_date/auto_archive/…)
+        # Требуются миграции для полей Group (status/end_date/auto_archive/…)
         start_auto_archive_loop()
 
 if __name__ == "__main__":
