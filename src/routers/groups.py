@@ -222,7 +222,7 @@ def get_groups_for_user(
             (GroupHidden.group_id == Group.id) & (GroupHidden.user_id == user_id)
         ).filter(GroupHidden.user_id.is_(None))
 
-    # 2.1) ПОИСК
+    # 2.1) ПОИСК: точная подстрока в name ИЛИ description
     if q:
         like = f"%{q.strip()}%"
         q_groups = q_groups.filter(
@@ -249,7 +249,7 @@ def get_groups_for_user(
         )
     )
 
-    # 4) total
+    # 4) total — СТРОГО после всех фильтров (user/hidden/archived/q)
     total = db.query(func.count(func.distinct(Group.id))).select_from(q_groups.subquery()).scalar() or 0
     response.headers["X-Total-Count"] = str(int(total))
 
