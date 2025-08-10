@@ -503,12 +503,14 @@ def update_group_schedule(
 ):
     """
     Обновление плановой даты окончания и флага авто-архивации.
-    Доступ: только владелец. Только для активной группы.
+    Доступ: ЛЮБОЙ УЧАСТНИК группы. Только для активной группы.
     Валидация:
       • если end_date задана — она должна быть >= сегодняшней даты;
       • если end_date очищена (null) — auto_archive автоматически сбрасывается в False.
     """
-    group = require_owner(db, group_id, current_user.id)
+    # было: group = require_owner(db, group_id, current_user.id)
+    require_membership(db, group_id, current_user.id)  # теперь любой участник
+    group = get_group_or_404(db, group_id)
     ensure_group_active(group)
 
     # Определяем, какие поля реально прислали (pydantic v1/v2 совместимость)
