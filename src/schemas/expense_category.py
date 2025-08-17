@@ -1,4 +1,5 @@
 # src/schemas/expense_category.py
+
 from __future__ import annotations
 
 from typing import Optional, Dict
@@ -16,7 +17,7 @@ class ExpenseCategoryBase(BaseModel):
 
 
 class ExpenseCategoryCreate(ExpenseCategoryBase):
-    # group_id обычно приходит из path /groups/{id}/categories, поэтому здесь не указываем
+    # group_id обычно приходит из path /groups/{id}/categories
     pass
 
 
@@ -31,45 +32,34 @@ class ExpenseCategoryUpdate(BaseModel):
 
 class ExpenseCategoryOut(ExpenseCategoryBase):
     id: int
-    group_id: Optional[int] = None        # если у вас есть привязка к группе
+    group_id: Optional[int] = None
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
 
     class Config:
-        from_attributes = True  # Pydantic v2: ORM-mode
+        from_attributes = True
 
 
 class ExpenseCategoryLocalizedOut(ExpenseCategoryOut):
-    """
-    Расширение для локализованной выдачи.
-    Поддерживает два возможных подхода в БД:
-      1) Отдельные поля name_ru/name_en/name_es
-      2) Сериализованная мапа переводов (translations)
-    Если каких-то атрибутов в ORM-модели нет — они просто будут None.
-    """
-    # Вариант с явными колонками:
+    # Расширение для локализации (если используете)
     name_ru: Optional[str] = None
     name_en: Optional[str] = None
     name_es: Optional[str] = None
-    # Вариант с мапой (если храните JSONB и мапите на .translations):
     translations: Optional[Dict[str, str]] = None
 
 
-# >>> ВАЖНО: "мягкая" версия ТОЛЬКО для встраивания в транзакции <<<
 class ExpenseCategoryForTxOut(BaseModel):
     """
-    Версия категории для вложения в TransactionOut.
-    Здесь name НЕобязателен, чтобы не падать на частично заполненных/устаревших данных.
+    Мягкая схема для вложенной категории в TransactionOut:
+    НЕ требуем name, чтобы не падать на старых/битых записях.
     """
     id: int
-    # name допускаем пустой/None
     name: Optional[str] = None
     icon: Optional[str] = None
     color: Optional[str] = None
-    is_income: Optional[bool] = False
-    is_archived: Optional[bool] = False
+    is_income: Optional[bool] = None
+    is_archived: Optional[bool] = None
     parent_id: Optional[int] = None
-
     group_id: Optional[int] = None
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
@@ -83,5 +73,5 @@ __all__ = (
     "ExpenseCategoryUpdate",
     "ExpenseCategoryOut",
     "ExpenseCategoryLocalizedOut",
-    "ExpenseCategoryForTxOut",   # <-- экспортируем новую схему
+    "ExpenseCategoryForTxOut",
 )

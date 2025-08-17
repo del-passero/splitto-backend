@@ -1,6 +1,6 @@
 # src/routers/transactions.py
 # РОУТЕР ТРАНЗАКЦИЙ — Decimal-арифметика, проверка суммы долей, нормализация валюты,
-# пагинация со счетчиком, аккуратные фильтры по пользователю без дубликатов, join/selectin-load.
+# пагинация со счетчиком, аккуратные фильтры по пользователю без дубликатов, joinedload/selectinload.
 
 from __future__ import annotations
 
@@ -10,15 +10,12 @@ from typing import List, Optional, Dict
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from starlette import status
 from sqlalchemy.orm import Session, selectinload, joinedload
-from sqlalchemy import func, select  # func может пригодиться (не убираю)
+from sqlalchemy import select
 
 from src.db import get_db
 from src.models.transaction import Transaction
 from src.models.transaction_share import TransactionShare
-from src.models.group import Group                    # не трогаем, пусть будет
-from src.models.expense_category import ExpenseCategory  # не трогаем, пусть будет
 from src.schemas.transaction import TransactionCreate, TransactionOut
-from src.schemas.transaction_share import TransactionShareCreate, TransactionShareOut  # пусть лежит, на будущее
 
 # Авторизация (Telegram WebApp)
 from src.utils.telegram_dep import get_current_telegram_user
@@ -36,7 +33,6 @@ from src.utils.groups import (
 router = APIRouter()
 
 
-# --- Вспомогательная функция для "денежного" округления до 2 знаков ---
 def q2(x: Decimal) -> Decimal:
     return x.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
 
@@ -60,9 +56,9 @@ def get_transactions(
         db.query(Transaction)
         .filter(Transaction.is_deleted.is_(False))
         .options(
-            # Категорию часто отображаем рядом — подтянем сразу
+            # Категорию часто показываем рядом — грузим сразу
             joinedload(Transaction.category),
-            # Доли лучше подгружать selectin-стратегией (1 доп. запрос на все транзакции)
+            # Доли — selectin (1 доп. запрос на пачку транзакций)
             selectinload(Transaction.shares),
         )
     )
@@ -140,8 +136,8 @@ def create_transaction(
     """
     Создать транзакцию.
     - Валидируем членство/категорию/валюту.
-    - Склеиваем дублирующиеся shares (по user_id): amount суммируем в Decimal, shares — в int.
-    - Проверяем, что сумма долей === amount (с точностью до копейки).
+    - Склеиваем дублирующиеся shares (по user_id).
+    - Проверяем, что сумма долей === amount.
     """
     # 1) Автор — участник, группа активна
     group = guard_mutation_for_member(db, tx.group_id, current_user.id)
@@ -149,12 +145,13 @@ def create_transaction(
 
     # 2) Валюта транзакции = валюта группы (или подставляем её); код в верхнем регистре
     tx_currency = (tx.currency or "").strip().upper()
-    group_currency = (group.default_currency_code or "").strip().upper()
+    group_currency = (getattr(group, "default_currency_code", None) or "").strip().upper()
     if tx_currency:
         if group_currency and tx_currency != group_currency:
             raise HTTPException(status_code=409, detail="Transaction currency must match group currency")
     else:
         tx_currency = group_currency
+    tx_currency = tx_currency or None  # не пишем пустые строки в БД
 
     # 3) Категория (если указана) должна быть разрешена
     if tx.category_id is not None:
@@ -170,19 +167,18 @@ def create_transaction(
             raise HTTPException(status_code=422, detail="paid_by is required for expense")
         if tx.paid_by not in group_member_ids:
             raise HTTPException(status_code=400, detail="paid_by must be a member of the group")
-        # Для расходов transfer_* поля запрещаем ради чистоты данных
+        # Для расходов transfer_* запрещаем
         if tx.transfer_from is not None or (tx.transfer_to and len(tx.transfer_to) > 0):
             raise HTTPException(status_code=422, detail="transfer_from/transfer_to are not allowed for expense")
 
     elif tx.type == "transfer":
-        # Для transfer — требуем валидные поля
         if tx.transfer_from is None or not tx.transfer_to:
             raise HTTPException(status_code=422, detail="transfer_from and a non-empty transfer_to are required for transfer")
         if tx.transfer_from not in group_member_ids:
             raise HTTPException(status_code=400, detail="transfer_from must be a member of the group")
         if any(uid not in group_member_ids for uid in tx.transfer_to):
             raise HTTPException(status_code=400, detail="All transfer_to users must be group members")
-        # Для переводов paid_by/category_id/split_type/shares не используем
+        # Для переводов shares обычно не используется (не запрещаем, но ниже просто не будет вставки, если пусто)
 
     # 5) Склейка дублей shares по user_id (Decimal!)
     aggregated_shares: Dict[int, Dict[str, Decimal | int | None]] = {}
@@ -193,13 +189,11 @@ def create_transaction(
                 raise HTTPException(status_code=400, detail=f"User {uid} is not a member of the group")
 
             entry = aggregated_shares.setdefault(uid, {"amount": Decimal("0.00"), "shares": 0})
-            # Приводим через str(...) — на входе это Decimal (Money), но так безопаснее
             entry["amount"] = q2(Decimal(str(entry["amount"])) + Decimal(str(share.amount)))
-            # shares может быть None — суммируем только если есть число
             if share.shares is not None:
                 entry["shares"] = int(entry["shares"]) + int(share.shares)
 
-    # 6) Жёсткая серверная проверка: сумма долей == сумма транзакции (до копейки)
+    # 6) Жёсткая проверка: сумма долей == сумма транзакции (до копейки)
     total_amount = q2(Decimal(str(tx.amount)))
     if aggregated_shares:
         total_shares = q2(sum((Decimal(str(p["amount"])) for p in aggregated_shares.values()), Decimal("0.00")))
@@ -210,7 +204,6 @@ def create_transaction(
             )
 
     # 7) Создаём транзакцию
-    # Аккуратно формируем dict без поля 'shares'
     tx_dict = tx.model_dump(exclude={"shares"})
     tx_dict["created_by"] = current_user.id
     tx_dict["currency"] = tx_currency
@@ -218,7 +211,7 @@ def create_transaction(
     db.add(new_tx)
     db.flush()  # нужен id транзакции для связей
 
-    # 8) Вставляем доли (если есть). Для transfer обычно долей нет — и это ок.
+    # 8) Вставляем доли (если есть)
     if aggregated_shares:
         shares_objs = []
         for uid, payload in aggregated_shares.items():
@@ -255,20 +248,18 @@ def delete_transaction(
 ):
     """
     Мягкое удаление транзакции (soft delete).
-    Разрешено автору или плательщику (можете расширить правила).
+    Удалять может автор или плательщик.
     """
     tx = db.query(Transaction).filter(Transaction.id == transaction_id).first()
     if not tx:
         raise HTTPException(status_code=404, detail="Транзакция не найдена")
 
-    # Возвращаем исходную логику: берём объект группы из require_membership и проверяем активность
     group = require_membership(db, tx.group_id, current_user.id)
     ensure_group_active(group)
 
     if tx.is_deleted:
         return Response(status_code=status.HTTP_204_NO_CONTENT)
 
-    # Простая политика: удалять может автор или плательщик (для transfer можно расширить логику)
     if current_user.id not in {tx.created_by, tx.paid_by}:
         raise HTTPException(status_code=403, detail="Only author or payer can delete the transaction")
 
