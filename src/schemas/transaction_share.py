@@ -1,6 +1,5 @@
 # src/schemas/transaction_share.py
 # Pydantic-схемы долей по транзакции (Base/Create/Out)
-
 from __future__ import annotations
 
 from decimal import Decimal
@@ -17,9 +16,7 @@ class TransactionShareBase(BaseModel):
     Базовая схема доли по расходу/транзакции.
     """
     user_id: int = Field(..., description="ID участника группы")
-    # Было: float → стало: Decimal (Money) для исключения ошибок округления
     amount: Money = Field(..., description="Сумма доли участника")
-    # Если используется split_type='shares', то здесь можно передать число долей (целое, >=1)
     shares: Optional[int] = Field(default=None, ge=1, description="Число долей (для split_type='shares')")
 
 

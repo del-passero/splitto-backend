@@ -36,7 +36,8 @@ class ExpenseCategoryOut(ExpenseCategoryBase):
     updated_at: Optional[datetime] = None
 
     class Config:
-        from_attributes = True  # Pydantic v2: ORM-mode
+        # Pydantic v1: ORM-mode
+        orm_mode = True
 
 
 class ExpenseCategoryLocalizedOut(ExpenseCategoryOut):

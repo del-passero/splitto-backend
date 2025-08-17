@@ -10,15 +10,15 @@ from typing import List, Optional, Dict
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from starlette import status
 from sqlalchemy.orm import Session, selectinload, joinedload
-from sqlalchemy import func, select
+from sqlalchemy import func, select  # func может пригодиться (не убираю)
 
 from src.db import get_db
 from src.models.transaction import Transaction
 from src.models.transaction_share import TransactionShare
-from src.models.group import Group
-from src.models.expense_category import ExpenseCategory
+from src.models.group import Group                    # не трогаем, пусть будет
+from src.models.expense_category import ExpenseCategory  # не трогаем, пусть будет
 from src.schemas.transaction import TransactionCreate, TransactionOut
-from src.schemas.transaction_share import TransactionShareCreate, TransactionShareOut
+from src.schemas.transaction_share import TransactionShareCreate, TransactionShareOut  # пусть лежит, на будущее
 
 # Авторизация (Telegram WebApp)
 from src.utils.telegram_dep import get_current_telegram_user
@@ -182,8 +182,7 @@ def create_transaction(
             raise HTTPException(status_code=400, detail="transfer_from must be a member of the group")
         if any(uid not in group_member_ids for uid in tx.transfer_to):
             raise HTTPException(status_code=400, detail="All transfer_to users must be group members")
-        # Для переводов paid_by/category_id/ split_type/shares как правило не используются
-        # (не запрещаем жёстко, но игнорируем вставку shares ниже, если их нет)
+        # Для переводов paid_by/category_id/split_type/shares не используем
 
     # 5) Склейка дублей shares по user_id (Decimal!)
     aggregated_shares: Dict[int, Dict[str, Decimal | int | None]] = {}
@@ -201,7 +200,6 @@ def create_transaction(
                 entry["shares"] = int(entry["shares"]) + int(share.shares)
 
     # 6) Жёсткая серверная проверка: сумма долей == сумма транзакции (до копейки)
-    # Проверяем только если доли переданы (для equal можно не передавать)
     total_amount = q2(Decimal(str(tx.amount)))
     if aggregated_shares:
         total_shares = q2(sum((Decimal(str(p["amount"])) for p in aggregated_shares.values()), Decimal("0.00")))
@@ -263,6 +261,7 @@ def delete_transaction(
     if not tx:
         raise HTTPException(status_code=404, detail="Транзакция не найдена")
 
+    # Возвращаем исходную логику: берём объект группы из require_membership и проверяем активность
     group = require_membership(db, tx.group_id, current_user.id)
     ensure_group_active(group)
 
