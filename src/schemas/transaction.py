@@ -4,12 +4,13 @@ from __future__ import annotations
 
 from decimal import Decimal, ROUND_HALF_UP
 from typing import List, Optional, Literal
-from datetime import datetime
 
+from datetime import datetime
 from pydantic import BaseModel, Field, validator, condecimal
 
 from src.schemas.transaction_share import TransactionShareOut, TransactionShareBase
-from src.schemas.expense_category import ExpenseCategoryOut
+# ВАЖНО: используем "мягкую" схему категории ТОЛЬКО для TransactionOut
+from src.schemas.expense_category import ExpenseCategoryForTxOut
 
 
 # Точный тип для денег: 0.00 … 9999999999.99 (12 знаков всего, 2 после запятой)
@@ -26,32 +27,32 @@ class TransactionBase(BaseModel):
     Базовая схема транзакции (общие поля, без id и created_by).
     """
     group_id: int
-    # 'expense' — расход, 'transfer' — перевод
-    type: Literal["expense", "transfer"]
+    # Было: type: str → стало жёстко ограниченное множество значений
+    type: Literal["expense", "transfer"]  # 'expense' — расход, 'transfer' — перевод
 
-    # Денежные значения как Decimal (Money) для точности
+    # Было: float → стало Decimal (Money) для точных денежных расчётов
     amount: Money
 
     date: datetime = Field(default_factory=datetime.utcnow)
     comment: Optional[str] = None
 
-    # Категория применима только к расходам
+    # Категория применима только к расходам; валидируем логику в роутере
     category_id: Optional[int] = None
 
-    # Для расходов — кто платил
+    # Для расходов — кто платил; проверяем в роутере, что заполнено при type='expense'
     paid_by: Optional[int] = None
 
-    # Тип деления суммы
+    # Было: str → стало ограниченное множество (или None)
     split_type: Optional[Literal["equal", "shares", "custom"]] = None
 
     # Для переводов
     transfer_from: Optional[int] = None
-    transfer_to: Optional[List[int]] = None  # Один или несколько получателей
+    transfer_to: Optional[List[int]] = None  # Один или несколько получателей (для transfer)
 
-    # Валюта (ISO 4217)
+    # Валюта: нормализуем к UPPER и длине 3 символа (ISO 4217)
     currency: Optional[str] = Field(default=None, min_length=3, max_length=3)
 
-    # Чек
+    # Чек — как и прежде
     receipt_url: Optional[str] = None
     receipt_data: Optional[dict] = None  # Структура распознанного чека (опционально)
 
@@ -70,6 +71,7 @@ class TransactionCreate(TransactionBase):
     Схема для создания транзакции через API.
     created_by не передаётся с фронта — он вычисляется на backend.
     """
+    # Было: Optional[List[TransactionShareBase]] = None
     # Оставляем Optional, но валидируем сумму долей при split_type in {'custom','shares'}
     shares: Optional[List[TransactionShareBase]] = None
 
@@ -86,6 +88,7 @@ class TransactionCreate(TransactionBase):
             if not shares or len(shares) == 0:
                 raise ValueError("Для split_type='custom' или 'shares' обязательно передать список долей 'shares'")
 
+            # Суммируем как Decimal с квантованием
             total = Decimal("0.00")
             for s in shares:
                 total += Decimal(str(s.amount))
@@ -112,12 +115,13 @@ class TransactionOut(TransactionBase):
     created_at: datetime
     updated_at: datetime
 
-    # Вложенная категория (если есть)
-    category: Optional[ExpenseCategoryOut] = None
+    # Вложенная категория — используем "мягкую" версию
+    category: Optional[ExpenseCategoryForTxOut] = None
 
-    # Безопасный дефолт для списка
+    # Было: shares: List[TransactionShareOut] = []
+    # Стало: безопасный дефолт через default_factory (чтобы не было шаринга одного списка между инстансами)
     shares: List[TransactionShareOut] = Field(default_factory=list)
 
     class Config:
-        # Pydantic v1: позволяем заполнять из ORM-моделей
-        orm_mode = True
+        # как в твоём проекте: работаем с ORM-моделями
+        from_attributes = True

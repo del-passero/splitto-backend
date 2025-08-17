@@ -36,8 +36,7 @@ class ExpenseCategoryOut(ExpenseCategoryBase):
     updated_at: Optional[datetime] = None
 
     class Config:
-        # Pydantic v1: ORM-mode
-        orm_mode = True
+        from_attributes = True  # Pydantic v2: ORM-mode
 
 
 class ExpenseCategoryLocalizedOut(ExpenseCategoryOut):
@@ -56,9 +55,33 @@ class ExpenseCategoryLocalizedOut(ExpenseCategoryOut):
     translations: Optional[Dict[str, str]] = None
 
 
+# >>> ВАЖНО: "мягкая" версия ТОЛЬКО для встраивания в транзакции <<<
+class ExpenseCategoryForTxOut(BaseModel):
+    """
+    Версия категории для вложения в TransactionOut.
+    Здесь name НЕобязателен, чтобы не падать на частично заполненных/устаревших данных.
+    """
+    id: int
+    # name допускаем пустой/None
+    name: Optional[str] = None
+    icon: Optional[str] = None
+    color: Optional[str] = None
+    is_income: Optional[bool] = False
+    is_archived: Optional[bool] = False
+    parent_id: Optional[int] = None
+
+    group_id: Optional[int] = None
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
+
+    class Config:
+        from_attributes = True
+
+
 __all__ = (
     "ExpenseCategoryCreate",
     "ExpenseCategoryUpdate",
     "ExpenseCategoryOut",
     "ExpenseCategoryLocalizedOut",
+    "ExpenseCategoryForTxOut",   # <-- экспортируем новую схему
 )
