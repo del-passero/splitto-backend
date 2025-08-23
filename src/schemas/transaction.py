@@ -82,6 +82,14 @@ class TransactionCreate(TransactionBase):
         return shares
 
 
+class TransactionUpdate(TransactionBase):
+    """
+    Модель для обновления. Поля те же, что и при создании.
+    Жёсткая проверка суммы долей выполняется в роутере аналогично create.
+    """
+    shares: Optional[List[TransactionShareBase]] = None
+
+
 class TransactionOut(TransactionBase):
     id: int
     created_by: int
