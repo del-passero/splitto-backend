@@ -30,6 +30,6 @@ async def auth_via_telegram(request: Request, db: Session = Depends(get_db)) -> 
     if not init_data:
         raise HTTPException(status_code=400, detail="initData is required")
 
-    # Создаём пользователя при первом входе, иначе лениво обновляем профиль (включая language_code).
+    # Создаём пользователя при первом входе, иначе лениво обновляем профиль (включая language_code->'en' по умолчанию)
     user = validate_and_sync_user(init_data, db, create_if_missing=True)
     return user

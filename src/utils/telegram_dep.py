@@ -24,6 +24,19 @@ _auth_secret = generate_secret_key(TELEGRAM_BOT_TOKEN)
 authenticator = TelegramAuthenticator(_auth_secret)
 
 
+def _normalize_lang(code: Optional[str]) -> str:
+    """
+    Схлопываем код языка до {ru,en,es}.
+    Если язык не пришёл (частый кейс для English) — используем 'en'.
+    """
+    if not code:
+        return "en"
+    c = code.lower()
+    if "-" in c:
+        c = c.split("-")[0]
+    return c if c in {"ru", "en", "es"} else "en"
+
+
 def _get_init_data_from_request(request: Request, body: Optional[dict]) -> Optional[str]:
     """
     Пытаемся достать initData:
@@ -63,7 +76,8 @@ def _apply_user_fields_from_tg(u: User, tg_user) -> bool:
     last_name = getattr(tg_user, "last_name", None)
     username = getattr(tg_user, "username", None)
     photo_url = getattr(tg_user, "photo_url", None)
-    language_code = getattr(tg_user, "language_code", None)
+    language_code_raw = getattr(tg_user, "language_code", None)
+    language_code = _normalize_lang(language_code_raw)
     allows = getattr(tg_user, "allows_write_to_pm", getattr(u, "allows_write_to_pm", True))
 
     upd("first_name", first_name)
@@ -73,7 +87,7 @@ def _apply_user_fields_from_tg(u: User, tg_user) -> bool:
     upd("language_code", language_code)
     upd("allows_write_to_pm", allows)
 
-    # Собираем display name и обновляем, если отличается
+    # Обновляем display name
     new_name = get_display_name(first_name=first_name, last_name=last_name, username=username, telegram_id=u.telegram_id)
     if getattr(u, "name", None) != new_name:
         u.name = new_name
@@ -109,10 +123,9 @@ def validate_and_sync_user(init_data: str, db: Session, *, create_if_missing: bo
             last_name=getattr(tg_user, "last_name", None),
             username=getattr(tg_user, "username", None),
             photo_url=getattr(tg_user, "photo_url", None),
-            language_code=getattr(tg_user, "language_code", None),
+            language_code=_normalize_lang(getattr(tg_user, "language_code", None)),
             allows_write_to_pm=getattr(tg_user, "allows_write_to_pm", True),
         )
-        # name по нашим правилам
         user.name = get_display_name(
             first_name=user.first_name,
             last_name=user.last_name,
@@ -139,7 +152,7 @@ async def get_current_telegram_user(request: Request, db: Session = Depends(get_
     - достаёт initData из запроса
     - валидирует
     - находит существующего пользователя
-    - лениво обновляет его поля (включая language_code)
+    - лениво обновляет его поля (включая language_code -> с фолбэком на 'en')
     """
     body = None
     if request.method in {"POST", "PUT", "PATCH"}:
