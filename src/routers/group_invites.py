@@ -6,7 +6,10 @@ from sqlalchemy.orm import Session
 from src.db import get_db
 from src.models.user import User
 from src.models.group import Group
-from src.utils.telegram_dep import get_current_telegram_user
+from src.utils.telegram_dep import (
+    get_current_telegram_user,
+    get_current_telegram_user_or_create,  # ← ДОБАВЛЕНО
+)
 
 from src.services.group_invite_token import (
     create_group_invite_token,
@@ -15,6 +18,7 @@ from src.services.group_invite_token import (
 from src.services.group_membership import is_member, ensure_member
 
 router = APIRouter(tags=["Инвайты групп"])
+
 
 @router.post("/groups/{group_id}/invite", response_model=dict)
 def create_group_invite(
@@ -37,11 +41,13 @@ def create_group_invite(
     # Бек не строит полную ссылку — фронт подставит startapp=<token> как в дружбе.
     return {"token": token}
 
+
 @router.post("/groups/invite/accept", response_model=dict)
 def accept_group_invite(
     token: str = Body(..., embed=True),
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_telegram_user),
+    # ВАЖНО: создаём пользователя, если он впервые пришёл по ссылке
+    current_user: User = Depends(get_current_telegram_user_or_create),
 ):
     """
     Принять инвайт в группу по токену. Если уже участник — просто success.

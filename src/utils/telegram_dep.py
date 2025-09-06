@@ -169,3 +169,26 @@ async def get_current_telegram_user(request: Request, db: Session = Depends(get_
         )
 
     return validate_and_sync_user(init_data, db, create_if_missing=False)
+
+
+# --- ДОБАВЛЕНО: зависимость «создай, если нет» (нужна для акцепта группового инвайта) ---
+async def get_current_telegram_user_or_create(request: Request, db: Session = Depends(get_db)) -> User:
+    """
+    То же самое, что get_current_telegram_user, но с create_if_missing=True.
+    Использовать там, где новый пользователь заходит в приложение впервые по инвайт-ссылке.
+    """
+    body = None
+    if request.method in {"POST", "PUT", "PATCH"}:
+        try:
+            body = await request.json()
+        except Exception:
+            body = None
+
+    init_data = _get_init_data_from_request(request, body)
+    if not init_data:
+        raise HTTPException(
+            status_code=401,
+            detail="initData required (JSON 'initData', header 'x-telegram-initdata' or '?init_data=...')",
+        )
+
+    return validate_and_sync_user(init_data, db, create_if_missing=True)
