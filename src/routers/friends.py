@@ -1,4 +1,5 @@
-# backend/src/routers/friends.py
+# src/routers/friends.py
+
 from fastapi import APIRouter, Depends, HTTPException, Body, Query
 from sqlalchemy.orm import Session
 from typing import List, Optional
@@ -15,7 +16,7 @@ from src.utils.telegram_dep import get_current_telegram_user
 import secrets
 from datetime import datetime
 
-# для общих групп
+# Для общих групп и «друзей контакта»
 from src.models.group_member import GroupMember
 from src.models.group import Group
 
@@ -31,17 +32,18 @@ def get_friends(
 ):
     """
     Получить список друзей текущего пользователя (с пагинацией).
-    ВАЖНО: user = текущий пользователь, friend = профиль друга.
+    В user — профиль ДРУГА (как ожидает фронт AddGroupMembersModal).
     """
     query = db.query(Friend).filter(Friend.user_id == current_user.id)
     if show_hidden is not None:
         query = query.filter(Friend.hidden == show_hidden)
-    total = query.count()
-    friends = query.offset(offset).limit(limit).all()
 
-    # Bulk fetch
+    # стабильный порядок: по дате добавления (сначала более новые)
+    total = query.count()
+    friends = query.order_by(Friend.created_at.desc()).offset(offset).limit(limit).all()
+
     friend_ids = [f.friend_id for f in friends]
-    profiles = db.query(User).filter(User.id.in_(friend_ids)).all()
+    profiles = db.query(User).filter(User.id.in_(friend_ids)).all() if friend_ids else []
     profiles_map = {u.id: u for u in profiles}
 
     result = []
@@ -55,8 +57,8 @@ def get_friends(
                 created_at=link.created_at,
                 updated_at=link.updated_at,
                 hidden=link.hidden,
-                user=UserOut.from_orm(current_user),                 # ← МЫ
-                friend=UserOut.from_orm(friend_profile) if friend_profile else None  # ← ДРУГ
+                user=UserOut.from_orm(friend_profile) if friend_profile else None,  # ДРУГ
+                friend=UserOut.from_orm(current_user),                               # МЫ
             )
         )
 
@@ -75,6 +77,7 @@ def create_invite(
     db.refresh(invite)
     return invite
 
+
 @router.post("/accept", response_model=dict)
 def accept_invite(
     token: str = Body(..., embed=True),
@@ -88,6 +91,7 @@ def accept_invite(
     to_user_id = current_user.id
     if from_user_id == to_user_id:
         return {"success": True}
+
     exists = db.query(Friend).filter(
         Friend.user_id == from_user_id,
         Friend.friend_id == to_user_id
@@ -100,6 +104,7 @@ def accept_invite(
         db.add(Event(actor_id=from_user_id, target_user_id=to_user_id, type="friend_added", data=None))
         db.add(Event(actor_id=to_user_id, target_user_id=from_user_id, type="friend_added", data=None))
         db.commit()
+
     usage = db.query(InviteUsage).filter_by(user_id=to_user_id).first()
     if not usage:
         db.add(InviteUsage(invite_id=invite.id, user_id=to_user_id))
@@ -110,7 +115,9 @@ def accept_invite(
         db.add(Event(actor_id=from_user_id, target_user_id=to_user_id, type="invite_registered", data={"invite_id": invite.id}))
         db.add(Event(actor_id=to_user_id, target_user_id=from_user_id, type="invite_registered", data={"invite_id": invite.id}))
         db.commit()
+
     return {"success": True}
+
 
 @router.post("/{friend_id}/hide", response_model=dict)
 def hide_friend(
@@ -118,15 +125,16 @@ def hide_friend(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_telegram_user)
 ):
-    friend = db.query(Friend).filter_by(user_id=current_user.id, friend_id=friend_id).first()
-    if not friend:
+    link = db.query(Friend).filter_by(user_id=current_user.id, friend_id=friend_id).first()
+    if not link:
         raise HTTPException(404, detail="Friend not found")
-    friend.hidden = True
-    friend.updated_at = datetime.utcnow()
+    link.hidden = True
+    link.updated_at = datetime.utcnow()
     db.commit()
     db.add(Event(actor_id=current_user.id, target_user_id=friend_id, type="friend_hidden", data=None))
     db.commit()
     return {"success": True}
+
 
 @router.post("/{friend_id}/unhide", response_model=dict)
 def unhide_friend(
@@ -134,15 +142,16 @@ def unhide_friend(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_telegram_user)
 ):
-    friend = db.query(Friend).filter_by(user_id=current_user.id, friend_id=friend_id).first()
-    if not friend:
+    link = db.query(Friend).filter_by(user_id=current_user.id, friend_id=friend_id).first()
+    if not link:
         raise HTTPException(404, detail="Friend not found")
-    friend.hidden = False
-    friend.updated_at = datetime.utcnow()
+    link.hidden = False
+    link.updated_at = datetime.utcnow()
     db.commit()
     db.add(Event(actor_id=current_user.id, target_user_id=friend_id, type="friend_unhidden", data=None))
     db.commit()
     return {"success": True}
+
 
 @router.get("/invite/{token}/stats", response_model=dict)
 def invite_stats(
@@ -155,7 +164,11 @@ def invite_stats(
         raise HTTPException(404, detail={"code": "invite_not_found"})
     usages = db.query(InviteUsage).filter_by(invite_id=invite.id).all()
     uses_count = len(usages)
-    return {"uses_count": uses_count, "usages": [{"user_id": u.user_id, "used_at": u.used_at} for u in usages]}
+    return {
+        "uses_count": uses_count,
+        "usages": [{"user_id": u.user_id, "used_at": u.used_at} for u in usages]
+    }
+
 
 @router.get("/search", response_model=dict)
 def search_friends(
@@ -167,20 +180,22 @@ def search_friends(
     limit: int = Query(50, gt=0)
 ):
     """
-    Поиск среди друзей текущего пользователя.
-    ВАЖНО: user = текущий пользователь, friend = найденный друг.
+    Поиск среди МОИХ друзей (по username/first_name/last_name).
+    В user — найденный ДРУГ (как ждёт фронт).
     """
-    friend_ids_query = db.query(Friend.friend_id).filter(Friend.user_id == current_user.id)
+    friend_ids_q = db.query(Friend.friend_id).filter(Friend.user_id == current_user.id)
     if show_hidden is not None:
-        friend_ids_query = friend_ids_query.filter(Friend.hidden == show_hidden)
-    friend_ids = [row[0] for row in friend_ids_query]
+        friend_ids_q = friend_ids_q.filter(Friend.hidden == show_hidden)
+    friend_ids = [row[0] for row in friend_ids_q]
 
-    search_query = db.query(User).filter(
+    sq = db.query(User).filter(
         User.id.in_(friend_ids),
-        (User.username.ilike(f"%{query}%") | User.first_name.ilike(f"%{query}%") | User.last_name.ilike(f"%{query}%"))
+        (User.username.ilike(f"%{query}%") |
+         User.first_name.ilike(f"%{query}%") |
+         User.last_name.ilike(f"%{query}%"))
     )
-    total = search_query.count()
-    users = search_query.offset(offset).limit(limit).all()
+    total = sq.count()
+    users = sq.order_by(User.first_name.asc(), User.last_name.asc(), User.username.asc()).offset(offset).limit(limit).all()
 
     if users:
         user_ids = [u.id for u in users]
@@ -190,8 +205,8 @@ def search_friends(
         link_map = {}
 
     result = []
-    for u in users:
-        link = link_map.get(u.id)
+    for user in users:
+        link = link_map.get(user.id)
         if not link:
             continue
         result.append(
@@ -202,14 +217,13 @@ def search_friends(
                 created_at=link.created_at,
                 updated_at=link.updated_at,
                 hidden=link.hidden,
-                user=UserOut.from_orm(current_user),  # ← МЫ
-                friend=UserOut.from_orm(u),            # ← ДРУГ
+                user=UserOut.from_orm(user),            # ДРУГ
+                friend=UserOut.from_orm(current_user),   # МЫ
             )
         )
-
     return {"total": total, "friends": result}
 
-# ===================== Контактная страница =====================
+# ===== Детали контакта и связанные данные =====
 
 @router.get("/{friend_id}", response_model=FriendOut)
 def get_friend_detail(
@@ -230,9 +244,10 @@ def get_friend_detail(
         created_at=link.created_at,
         updated_at=link.updated_at,
         hidden=link.hidden,
-        user=UserOut.from_orm(current_user),   # мы
-        friend=UserOut.from_orm(contact),      # контакт
+        user=UserOut.from_orm(contact),        # ДРУГ
+        friend=UserOut.from_orm(current_user), # МЫ
     )
+
 
 @router.get("/{friend_id}/common-groups", response_model=List[str])
 def get_common_group_names(
@@ -252,6 +267,7 @@ def get_common_group_names(
     )
     return [row[0] for row in names]
 
+
 @router.get("/of/{user_id}", response_model=dict)
 def get_friends_of_user(
     user_id: int,
@@ -260,12 +276,16 @@ def get_friends_of_user(
     offset: int = Query(0, ge=0),
     limit: int = Query(50, gt=0),
 ):
+    """
+    Друзья указанного пользователя (для вкладки «Друзья контакта»).
+    Контракт фронта: ДРУГ -> user, Владелец списка -> friend.
+    """
     q = db.query(Friend).filter(Friend.user_id == user_id)
     total = q.count()
-    links = q.offset(offset).limit(limit).all()
+    links = q.order_by(Friend.created_at.desc()).offset(offset).limit(limit).all()
 
     ids = [l.friend_id for l in links] + [user_id]
-    profiles = db.query(User).filter(User.id.in_(set(ids))).all()
+    profiles = db.query(User).filter(User.id.in_(set(ids))).all() if ids else []
     profiles_map = {u.id: u for u in profiles}
     owner = profiles_map.get(user_id)
 
@@ -282,8 +302,8 @@ def get_friends_of_user(
                 created_at=link.created_at,
                 updated_at=link.updated_at,
                 hidden=link.hidden,
-                user=UserOut.from_orm(owner),
-                friend=UserOut.from_orm(contact),
+                user=UserOut.from_orm(contact),  # ДРУГ
+                friend=UserOut.from_orm(owner),  # Владелец списка
             )
         )
 
