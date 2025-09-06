@@ -38,7 +38,7 @@ def get_friends(
     if show_hidden is not None:
         query = query.filter(Friend.hidden == show_hidden)
 
-    # стабильный порядок: по дате добавления (сначала более новые)
+    # стабильный порядок: по дате добавления (новые первыми)
     total = query.count()
     friends = query.order_by(Friend.created_at.desc()).offset(offset).limit(limit).all()
 
@@ -223,6 +223,7 @@ def search_friends(
         )
     return {"total": total, "friends": result}
 
+
 # ===== Детали контакта и связанные данные =====
 
 @router.get("/{friend_id}", response_model=FriendOut)
@@ -231,6 +232,9 @@ def get_friend_detail(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_telegram_user),
 ):
+    """
+    Детали ДРУГА (строгая проверка, что friend_id — ваш друг).
+    """
     link = db.query(Friend).filter_by(user_id=current_user.id, friend_id=friend_id).first()
     if not link:
         raise HTTPException(404, detail="Friend not found")
@@ -255,6 +259,9 @@ def get_common_group_names(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_telegram_user),
 ):
+    """
+    Названия общих групп. Работает и для НЕ-друзей (по user_id).
+    """
     my_group_ids = db.query(GroupMember.group_id).filter(GroupMember.user_id == current_user.id).subquery()
     his_group_ids = db.query(GroupMember.group_id).filter(GroupMember.user_id == friend_id).subquery()
 
@@ -295,16 +302,34 @@ def get_friends_of_user(
         if not contact or not owner:
             continue
         result.append(
-            FriendOut(
-                id=link.id,
-                user_id=link.user_id,
-                friend_id=link.friend_id,
-                created_at=link.created_at,
-                updated_at=link.updated_at,
-                hidden=link.hidden,
-                user=UserOut.from_orm(contact),  # ДРУГ
-                friend=UserOut.from_orm(owner),  # Владелец списка
-            )
+          FriendOut(
+              id=link.id,
+              user_id=link.user_id,
+              friend_id=link.friend_id,
+              created_at=link.created_at,
+              updated_at=link.updated_at,
+              hidden=link.hidden,
+              user=UserOut.from_orm(contact),  # ДРУГ
+              friend=UserOut.from_orm(owner),  # Владелец списка
+          )
         )
 
     return {"total": total, "friends": result}
+
+
+# ===== НОВОЕ: публичный профиль по user_id для НЕ-друзей =====
+
+@router.get("/user/{user_id}", response_model=UserOut)
+def get_user_profile_public(
+    user_id: int,
+    db: Session = Depends(get_db),
+    _current_user: User = Depends(get_current_telegram_user),
+):
+    """
+    Публичный профиль по user_id (минимум данных).
+    НЕ требует отношения дружбы.
+    """
+    user = db.query(User).filter_by(id=user_id).first()
+    if not user:
+        raise HTTPException(404, detail="User not found")
+    return UserOut.from_orm(user)
