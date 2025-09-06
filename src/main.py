@@ -29,6 +29,7 @@ from src.routers.expense_categories import router as expense_categories_router
 # --- Новые роутеры ---
 from src.routers.currencies import router as currencies_router
 from src.routers.group_categories import router as group_categories_router
+from src.routers.group_invites import router as group_invites_router  # ← ДОБАВЛЕНО
 
 # --- Фоновая задача автоархива (выключена по умолчанию) ---
 from src.jobs.auto_archive import start_auto_archive_loop
@@ -68,6 +69,7 @@ app.include_router(expense_categories_router, prefix="/api/expense-categories", 
 # Новые роутеры под общим /api
 app.include_router(currencies_router,       prefix="/api",                   tags=["Валюты"])
 app.include_router(group_categories_router, prefix="/api",                   tags=["Категории группы"])
+app.include_router(group_invites_router,    prefix="/api",                   tags=["Инвайты групп"])   # ← ДОБАВЛЕНО
 
 @app.get("/")
 def root():
