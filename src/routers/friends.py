@@ -1,4 +1,4 @@
-# src/routers/friends.py
+# backend/src/routers/friends.py
 
 from fastapi import APIRouter, Depends, HTTPException, Body, Query
 from sqlalchemy.orm import Session
@@ -15,6 +15,10 @@ from src.schemas.user import UserOut
 from src.utils.telegram_dep import get_current_telegram_user
 import secrets
 from datetime import datetime
+
+# NEW: для общих групп
+from src.models.group_member import GroupMember
+from src.models.group import Group
 
 router = APIRouter(tags=["Друзья"])
 
@@ -51,8 +55,8 @@ def get_friends(
                 created_at=friend.created_at,
                 updated_at=friend.updated_at,
                 hidden=friend.hidden,
-                user=UserOut.from_orm(friend_profile),
-                friend=UserOut.from_orm(current_user)
+                user=UserOut.from_orm(current_user),
+                friend=UserOut.from_orm(friend_profile) if friend_profile else None
             )
         )
 
@@ -263,7 +267,6 @@ def search_friends(
     for user in users:
         friend_link = friend_link_map.get(user.id)
         if not friend_link:
-            # Могут быть несогласованные данные, но такого почти не бывает
             continue
         result.append(
             FriendOut(
@@ -273,8 +276,8 @@ def search_friends(
                 created_at=friend_link.created_at,
                 updated_at=friend_link.updated_at,
                 hidden=friend_link.hidden,
-                user=UserOut.from_orm(user),
-                friend=UserOut.from_orm(current_user)
+                user=UserOut.from_orm(current_user),
+                friend=UserOut.from_orm(user)
             )
         )
 
@@ -282,3 +285,106 @@ def search_friends(
         "total": total,
         "friends": result
     }
+
+# ===================== NEW ENDPOINTS FOR CONTACT PAGE =====================
+
+@router.get("/{friend_id}", response_model=FriendOut)
+def get_friend_detail(
+    friend_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_telegram_user),
+):
+    """
+    Детали дружбы для конкретного друга текущего пользователя.
+    friend_id — это ID пользователя-друга (как в hide/unhide).
+    """
+    link = db.query(Friend).filter_by(user_id=current_user.id, friend_id=friend_id).first()
+    if not link:
+        raise HTTPException(404, detail="Friend not found")
+    contact = db.query(User).filter_by(id=friend_id).first()
+    if not contact:
+        raise HTTPException(404, detail="User not found")
+    return FriendOut(
+        id=link.id,
+        user_id=link.user_id,
+        friend_id=link.friend_id,
+        created_at=link.created_at,
+        updated_at=link.updated_at,
+        hidden=link.hidden,
+        user=UserOut.from_orm(current_user),
+        friend=UserOut.from_orm(contact),
+    )
+
+
+@router.get("/{friend_id}/common-groups", response_model=List[str])
+def get_common_group_names(
+    friend_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_telegram_user),
+):
+    """
+    Возвращает только названия общих групп (string[]).
+    """
+    # set of group ids, где состоит current_user
+    my_group_ids = db.query(GroupMember.group_id).filter(
+        GroupMember.user_id == current_user.id
+    ).subquery()
+
+    # set of group ids, где состоит friend_id (контакт)
+    his_group_ids = db.query(GroupMember.group_id).filter(
+        GroupMember.user_id == friend_id
+    ).subquery()
+
+    # пересечение по group_id и выбор только имён
+    names = (
+        db.query(Group.name)
+        .join(my_group_ids, my_group_ids.c.group_id == Group.id)
+        .join(his_group_ids, his_group_ids.c.group_id == Group.id)
+        .order_by(Group.name.asc())
+        .all()
+    )
+    return [row[0] for row in names]
+
+
+@router.get("/of/{user_id}", response_model=dict)
+def get_friends_of_user(
+    user_id: int,
+    db: Session = Depends(get_db),
+    _current_user: User = Depends(get_current_telegram_user),
+    offset: int = Query(0, ge=0),
+    limit: int = Query(50, gt=0),
+):
+    """
+    «Контакты контакта» (Вариант A): список друзей указанного пользователя.
+    Возвращаем в том же контракте { total, friends: FriendOut[] }.
+    """
+    q = db.query(Friend).filter(Friend.user_id == user_id)
+    total = q.count()
+    links = q.offset(offset).limit(limit).all()
+
+    # bulk user profiles
+    ids = [l.friend_id for l in links] + [user_id]
+    profiles = db.query(User).filter(User.id.in_(set(ids))).all()
+    profiles_map = {u.id: u for u in profiles}
+    owner = profiles_map.get(user_id)
+
+    result = []
+    for link in links:
+        contact = profiles_map.get(link.friend_id)
+        if not contact or not owner:
+            # пропускаем несогласованность
+            continue
+        result.append(
+            FriendOut(
+                id=link.id,
+                user_id=link.user_id,          # владелец списка (contact page owner)
+                friend_id=link.friend_id,      # его друг
+                created_at=link.created_at,
+                updated_at=link.updated_at,
+                hidden=link.hidden,
+                user=UserOut.from_orm(owner),
+                friend=UserOut.from_orm(contact),
+            )
+        )
+
+    return {"total": total, "friends": result}
