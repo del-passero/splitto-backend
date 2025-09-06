@@ -338,8 +338,19 @@ def delete_transaction(
   if tx.is_deleted:
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
-  if current_user.id not in {tx.created_by, tx.paid_by}:
-    raise HTTPException(status_code=403, detail="Only author or payer can delete the transaction")
+  # ПРАВА НА УДАЛЕНИЕ:
+  # expense  -> author (created_by) ИЛИ payer (paid_by)
+  # transfer -> author (created_by) ИЛИ sender (transfer_from)
+  allowed_ids = {tx.created_by}
+  if tx.type == "expense" and tx.paid_by is not None:
+    allowed_ids.add(tx.paid_by)
+  if tx.type == "transfer" and tx.transfer_from is not None:
+    allowed_ids.add(tx.transfer_from)
+
+  if current_user.id not in allowed_ids:
+    code = "tx_delete_forbidden_expense" if tx.type == "expense" else "tx_delete_forbidden_transfer"
+    # Возвращаем машинный код — фронт покажет локализованный текст по ключу.
+    raise HTTPException(status_code=403, detail={"code": code})
 
   tx.is_deleted = True
   db.commit()
