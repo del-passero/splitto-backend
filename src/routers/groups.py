@@ -1,31 +1,19 @@
 # src/routers/groups.py
-# РОУТЕР ДЛЯ ГРУПП: старый функционал + новые фичи и ПАГИНАЦИЯ
 # -----------------------------------------------------------------------------
-# Что здесь есть:
-#   • Балансы и settle-up (как было) — добавлена проверка членства.
-#   • Создание группы, список групп (теперь с limit/offset), детали группы (с offset/limit).
-#   • Список групп пользователя (ПАГИНАЦИЯ + сортировка по "активности", X-Total-Count).
-#   • Инвайты (создание/акцепт) — защищены, нельзя для archived/deleted.
-#   • Персональное скрытие (hide/unhide) — per-user.
-#   • Архивация/разархивация — глобально, только если нет долгов.
-#   • Soft-delete/restore — только если нет долгов.
-#   • Смена валюты группы (PATCH currency) — владелец, если в группе нет транзакций.
-#   • РАСПИСАНИЕ: PATCH schedule (end_date/auto_archive) — владелец, только для активной группы.
-#
-# Важно:
-#   • Мы НЕ удаляем старое поведение, только усиливаем и добавляем опции.
-#   • Новый порядок в /groups/user/{user_id}:
-#       - фильтры (deleted/hidden/archived + q по name/description),
-#       - считаем total из БАЗОВОГО запроса (без join'ов),
-#       - сортируем по last_activity (max(tx.date) DESC NULLS LAST, затем archived_at DESC, затем id DESC),
-#       - применяем limit/offset,
-#       - собираем превью участников так же, как раньше.
-#   • В ответ /groups/user/{user_id} добавлен заголовок `X-Total-Count` (тело НЕ меняем).
+# РОУТЕР: Группы
+# -----------------------------------------------------------------------------
+# Что есть:
+#   • Списки/детали, инвайты, скрытие для себя, архив/разархив, soft-delete/restore.
+#   • Балансы и settle-up: добавлен режим мультивалютности (по запросу ?multicurrency=1).
+#   • Смена валюты группы: теперь может делать ЛЮБОЙ УЧАСТНИК активной группы; запрет по наличию
+#     транзакций снят — валюта группы трактуется как «дефолт для новых».
+# -----------------------------------------------------------------------------
 
 from __future__ import annotations
 
-from typing import List, Optional
+from typing import List, Optional, Dict
 from datetime import datetime, date
+from decimal import Decimal
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from starlette import status
@@ -46,8 +34,6 @@ from src.schemas.group import GroupCreate, GroupOut
 from src.schemas.group_invite import GroupInviteOut
 from src.schemas.group_member import GroupMemberOut
 from src.schemas.user import UserOut
-from src.schemas.settlement import SettlementOut
-from src.utils.balance import calculate_group_balances, greedy_settle_up
 from src.utils.telegram_dep import get_current_telegram_user
 from src.utils.groups import (
     require_membership,
@@ -55,11 +41,14 @@ from src.utils.groups import (
     ensure_group_active,
     has_group_debts,
 )
+from src.utils.balance import (
+    calculate_group_balances_by_currency,
+    greedy_settle_up_single_currency,
+)
 
 import secrets
 
 router = APIRouter()
-
 
 # ===== Вспомогательные =====
 
@@ -101,7 +90,6 @@ def add_member_to_group(db: Session, group_id: int, user_id: int):
         db.commit()
         db.refresh(db_member)
 
-
 # ===== Балансы / Settle-up =====
 
 @router.get("/{group_id}/balances")
@@ -109,30 +97,63 @@ def get_group_balances(
     group_id: int,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_telegram_user),
+    multicurrency: bool = Query(False, description="Вернуть балансы по каждой валюте отдельно"),
 ):
     require_membership(db, group_id, current_user.id)
     member_ids = get_group_member_ids(db, group_id)
     transactions = get_group_transactions(db, group_id)
-    net_balance = calculate_group_balances(transactions, member_ids)
-    return [
-        {"user_id": uid, "balance": round(balance, 2)}
-        for uid, balance in net_balance.items()
-    ]
+
+    # Список валют и их decimals
+    codes = sorted({(tx.currency_code or "").upper() for tx in transactions if tx.currency_code})
+    decimals_map = {c.code: int(c.decimals) for c in db.query(Currency).filter(Currency.code.in_(codes)).all()}
+
+    by_ccy = calculate_group_balances_by_currency(transactions, member_ids)
+
+    if multicurrency:
+        # Формируем структуру { "USD": [{"user_id":..,"balance":..}, ...], ... }
+        result: Dict[str, List[Dict[str, Decimal]]] = {}
+        for code, balances in by_ccy.items():
+            d = decimals_map.get(code, 2)
+            result[code] = [{"user_id": uid, "balance": round(float(bal), d)} for uid, bal in balances.items()]
+        return result
+
+    # Легаси-режим: отдаём балансы ТОЛЬКО по default_currency_code группы (не смешиваем валюты)
+    group = get_group_or_404(db, group_id)
+    code = (group.default_currency_code or "").upper()
+    balances = by_ccy.get(code, {uid: Decimal("0") for uid in member_ids})
+    d = decimals_map.get(code, 2)
+    return [{"user_id": uid, "balance": round(float(bal), d)} for uid, bal in balances.items()]
 
 
-@router.get("/{group_id}/settle-up", response_model=List[SettlementOut])
+@router.get("/{group_id}/settle-up")
 def get_group_settle_up(
     group_id: int,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_telegram_user),
+    multicurrency: bool = Query(False, description="Вернуть граф выплат по каждой валюте отдельно"),
 ):
     require_membership(db, group_id, current_user.id)
     member_ids = get_group_member_ids(db, group_id)
     transactions = get_group_transactions(db, group_id)
-    net_balance = calculate_group_balances(transactions, member_ids)
-    settlements = greedy_settle_up(net_balance)
-    return settlements
 
+    codes = sorted({(tx.currency_code or "").upper() for tx in transactions if tx.currency_code})
+    currencies = {c.code: int(c.decimals) for c in db.query(Currency).filter(Currency.code.in_(codes)).all()}
+    by_ccy = calculate_group_balances_by_currency(transactions, member_ids)
+
+    if multicurrency:
+        # {"USD":[{from,to,amount}], "EUR":[...]}
+        result: Dict[str, List[Dict]] = {}
+        for code, balances in by_ccy.items():
+            d = currencies.get(code, 2)
+            result[code] = greedy_settle_up_single_currency(balances, d, code)
+        return result
+
+    # Легаси-режим: только по дефолтной валюте группы
+    group = get_group_or_404(db, group_id)
+    code = (group.default_currency_code or "").upper()
+    balances = by_ccy.get(code, {uid: Decimal("0") for uid in member_ids})
+    d = currencies.get(code, 2)
+    return greedy_settle_up_single_currency(balances, d, code)
 
 # ===== Создание и базовые списки =====
 
@@ -161,8 +182,7 @@ def get_groups(
         .all()
     )
 
-
-# ===== Группы пользователя (ПАГИНАЦИЯ + поиск + X-Total-Count) =====
+# ===== Группы пользователя (пагинация + поиск + X-Total-Count) =====
 
 @router.get("/user/{user_id}")
 def get_groups_for_user(
@@ -180,13 +200,11 @@ def get_groups_for_user(
     if user_id != current_user.id:
         raise HTTPException(status_code=403, detail="Forbidden")
 
-    # 1) id групп пользователя
     user_group_ids = [gid for (gid,) in db.query(GroupMember.group_id).filter(GroupMember.user_id == user_id).all()]
     if not user_group_ids:
         response.headers["X-Total-Count"] = "0"
         return []
 
-    # 2) БАЗОВЫЙ запрос с фильтрами (БЕЗ join'ов и order_by) — для корректного total
     base_q = db.query(Group).filter(
         Group.id.in_(user_group_ids),
         Group.deleted_at.is_(None),
@@ -194,6 +212,7 @@ def get_groups_for_user(
     if not include_archived:
         base_q = base_q.filter(Group.status == GroupStatus.active)
 
+    from src.models.group_hidden import GroupHidden
     if not include_hidden:
         base_q = base_q.outerjoin(
             GroupHidden,
@@ -204,11 +223,9 @@ def get_groups_for_user(
         like = f"%{q.strip()}%"
         base_q = base_q.filter((Group.name.ilike(like)) | (Group.description.ilike(like)))
 
-    # 3) total СЧИТАЕМ ИМЕННО ИЗ base_q
     total = base_q.count()
     response.headers["X-Total-Count"] = str(int(total))
 
-    # 4) Сортировка по "активности" + пагинация — только для items
     tx_dates_subq = (
         db.query(
             Transaction.group_id.label("g_id"),
@@ -235,7 +252,6 @@ def get_groups_for_user(
 
     page_group_ids = {g.id for g in page_groups}
 
-    # 5) превью участников
     members = (
         db.query(GroupMember, User)
         .join(User, GroupMember.user_id == User.id)
@@ -254,7 +270,6 @@ def get_groups_for_user(
             GroupMemberOut.from_orm(gm).dict() | {"user": UserOut.from_orm(user).dict()}
             for gm, user in gm_list
         ]
-        # владелец — первым
         member_objs_sorted = sorted(
             member_objs,
             key=lambda m: (m["user"]["id"] != group.owner_id, m["user"]["id"])
@@ -272,8 +287,6 @@ def get_groups_for_user(
         })
 
     return result
-
-
 
 # ===== Детали группы =====
 
@@ -301,7 +314,6 @@ def group_detail(
 
     group.members = members
     return group
-
 
 # ===== Инвайты =====
 
@@ -341,7 +353,6 @@ def accept_group_invite(
     add_member_to_group(db, group.id, current_user.id)
     return {"detail": "Успешно добавлен в группу"}
 
-
 # ===== Персональное скрытие =====
 
 @router.post("/{group_id}/hide", status_code=status.HTTP_204_NO_CONTENT)
@@ -352,6 +363,7 @@ def hide_group_for_me(
 ):
     require_membership(db, group_id, current_user.id)
 
+    from src.models.group_hidden import GroupHidden
     exists = db.scalar(
         select(func.count()).select_from(GroupHidden).where(
             GroupHidden.group_id == group_id,
@@ -373,6 +385,7 @@ def unhide_group_for_me(
 ):
     require_membership(db, group_id, current_user.id)
 
+    from src.models.group_hidden import GroupHidden
     row = db.query(GroupHidden).filter(
         GroupHidden.group_id == group_id,
         GroupHidden.user_id == current_user.id,
@@ -381,7 +394,6 @@ def unhide_group_for_me(
         return
     db.delete(row)
     db.commit()
-
 
 # ===== Архивация (глобально) =====
 
@@ -414,7 +426,6 @@ def unarchive_group(
     group.status = GroupStatus.active
     group.archived_at = None
     db.commit()
-
 
 # ===== Soft-delete / Restore =====
 
@@ -453,7 +464,6 @@ def restore_group(
     group.archived_at = datetime.utcnow()
     db.commit()
 
-
 # ===== Смена валюты группы =====
 
 @router.patch("/{group_id}/currency", status_code=status.HTTP_204_NO_CONTENT)
@@ -463,30 +473,19 @@ def change_group_currency(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_telegram_user),
 ):
-    # раньше: require_owner(db, group_id, current_user.id)
-    require_membership(db, group_id, current_user.id)  # ← теперь любой участник
-
+    # Доступ: ЛЮБОЙ УЧАСТНИК активной группы
+    require_membership(db, group_id, current_user.id)
     group = get_group_or_404(db, group_id)
     ensure_group_active(group)
 
     norm_code = code.upper().strip()
-
     cur = db.scalar(select(Currency).where(Currency.code == norm_code, Currency.is_active.is_(True)))
     if not cur:
         raise HTTPException(status_code=404, detail="Currency not found or inactive")
 
-    exists_tx = db.scalar(
-        select(func.count())
-        .select_from(Transaction)
-        .where(Transaction.group_id == group_id, Transaction.is_deleted.is_(False))
-    )
-    if exists_tx:
-        raise HTTPException(status_code=409, detail="Currency cannot be changed after transactions exist")
-
+    # ВНИМАНИЕ: запрет при наличии транзакций снят — валюта группы это дефолт для НОВЫХ
     group.default_currency_code = norm_code
     db.commit()
-
-
 
 # ===== Расписание (end_date / auto_archive) =====
 
@@ -508,30 +507,23 @@ def update_group_schedule(
       • если end_date задана — она должна быть >= сегодняшней даты;
       • если end_date очищена (null) — auto_archive автоматически сбрасывается в False.
     """
-    # было: group = require_owner(db, group_id, current_user.id)
-    require_membership(db, group_id, current_user.id)  # теперь любой участник
+    require_membership(db, group_id, current_user.id)
     group = get_group_or_404(db, group_id)
     ensure_group_active(group)
 
-    # Определяем, какие поля реально прислали (pydantic v1/v2 совместимость)
     fields_set = getattr(payload, "__fields_set__", getattr(payload, "model_fields_set", set()))
 
-    # 1) Изменение даты
     if "end_date" in fields_set:
         if payload.end_date is None:
-            # очищаем дату и принудительно выключаем автоархив
             group.end_date = None
             group.auto_archive = False
         else:
-            # простая валидация: дата не в прошлом
             today = date.today()
             if payload.end_date < today:
                 raise HTTPException(status_code=422, detail="end_date must be today or later")
             group.end_date = payload.end_date
 
-    # 2) Изменение флага auto_archive
     if "auto_archive" in fields_set:
-        # если дата очищена или отсутствует — форсим False
         if group.end_date is None:
             group.auto_archive = False
         else:

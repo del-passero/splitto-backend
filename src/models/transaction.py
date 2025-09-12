@@ -1,31 +1,49 @@
 # src/models/transaction.py
+# -----------------------------------------------------------------------------
+# МОДЕЛЬ: Transaction (SQLAlchemy)
+# -----------------------------------------------------------------------------
+# Назначение:
+#   - Храним расходы и переводы внутри группы.
+#   - Поддерживаем мультивалютность на уровне САМОЙ транзакции:
+#       • сумма amount — Decimal в БД (NUMERIC),
+#       • код валюты фиксируется в поле currency_code (ISO-4217, 3 буквы).
+#
+# Важные решения:
+#   • amount → NUMERIC(18,6) — чтобы не упираться в 2 знака и не ловить переполнения.
+#   • currency_code — строка длиной 3. NOT NULL и CHECK/FK включим миграцией.
+#   • Балансы/settle-up считаем ПО ОТДЕЛЬНОСТИ по каждой валюте (на уровне сервисов).
+#
+# Индексы:
+#   • (group_id, date) — частая сортировка/листинг.
+#   • (group_id, currency_code) WHERE is_deleted=false — быстрые выборки для балансов.
+#     (partial index задаётся через postgresql_where; потребует миграцию).
+# -----------------------------------------------------------------------------
+
+from __future__ import annotations
+
+from datetime import datetime
 
 from sqlalchemy import (
     Column,
     Integer,
     String,
     ForeignKey,
-    Numeric,          # ✅ вместо Float — денежные суммы храним как Numeric(12,2)
+    Numeric,
     DateTime,
     Boolean,
     JSON,
-    Index,            # ✅ индекс для быстрых выборок по группе и дате
+    Index,
+    text,  # для partial index (postgresql_where)
 )
 from sqlalchemy.orm import relationship
-from datetime import datetime
 
 from src.db import Base
 
 
 class Transaction(Base):
-    """
-    Транзакция — расход или транш в группе.
-    Важно: денежные суммы (amount) теперь хранятся как Decimal/Numeric(12,2), чтобы
-    исключить плавающие ошибки округления, присущие float.
-    """
     __tablename__ = "transactions"
 
-    # --- Основные поля ---
+    # --- Ключи/связи ---
     id = Column(Integer, primary_key=True, index=True)
 
     group_id = Column(
@@ -42,33 +60,41 @@ class Transaction(Base):
         comment="Пользователь, создавший транзакцию",
     )
 
+    # --- Тип и суммы ---
     type = Column(
         String,
         nullable=False,
         comment="'expense' — расход, 'transfer' — перевод (транш)",
     )
 
-    # ✅ БЫЛО: Float → СТАЛО: Numeric(12,2)
-    # Денежные суммы нельзя хранить в float из-за двоичной арифметики и ошибок округления.
     amount = Column(
-        Numeric(12, 2),
+        Numeric(18, 6),
         nullable=False,
-        comment="Сумма транзакции",
+        comment="Сумма транзакции (NUMERIC(18,6))",
     )
 
+    # Валюта транзакции (фиксируем на записи; дефолт берём из группы при создании, если не прислано)
+    currency_code = Column(
+        String(3),
+        nullable=True,  # станет NOT NULL после backfill миграцией
+        comment="Код валюты ISO-4217 (напр., 'USD'). Фиксируется на транзакции.",
+    )
+
+    # --- Даты/описание ---
     date = Column(
         DateTime,
         nullable=False,
         default=datetime.utcnow,
-        comment="Дата расхода/транша",
+        comment="Дата расхода/перевода",
     )
 
     comment = Column(
         String,
         nullable=True,
-        comment="Комментарий или описание",
+        comment="Комментарий/описание",
     )
 
+    # --- Реквизиты расхода/перевода ---
     category_id = Column(
         Integer,
         ForeignKey("expense_categories.id"),
@@ -93,20 +119,21 @@ class Transaction(Base):
         Integer,
         ForeignKey("users.id"),
         nullable=True,
-        comment="Отправитель денег (только для type='transfer')",
+        comment="Отправитель денег (для переводов)",
     )
 
     transfer_to = Column(
         JSON,
         nullable=True,
-        comment="Список получателей (user_id), для transfer — один или несколько, JSON-массив",
+        comment="Список получателей (user_id) для переводов; JSON-массив",
     )
 
+    # --- Техполя/чек ---
     created_at = Column(
         DateTime,
         nullable=False,
         default=datetime.utcnow,
-        comment="Дата и время создания",
+        comment="Когда создана запись",
     )
 
     updated_at = Column(
@@ -114,21 +141,13 @@ class Transaction(Base):
         nullable=False,
         default=datetime.utcnow,
         onupdate=datetime.utcnow,
-        comment="Дата и время последнего изменения",
-    )
-
-    # ✅ Ограничили длину кода валюты до 3 символов (ISO 4217),
-    # сам апстрим/роутер должен приводить к UPPER перед записью
-    currency = Column(
-        String(3),
-        nullable=True,
-        comment="Валюта транзакции, по умолчанию RUB",
+        comment="Когда последний раз изменяли",
     )
 
     is_deleted = Column(
         Boolean,
         default=False,
-        comment="Признак soft delete (архивирования)",
+        comment="Soft-delete флаг",
     )
 
     receipt_url = Column(
@@ -140,36 +159,32 @@ class Transaction(Base):
     receipt_data = Column(
         JSON,
         nullable=True,
-        comment="Результат распознавания чека (массив товаров, итог и т.д.)",
+        comment="Результат OCR/парсинга чека (если есть)",
     )
 
-    # --- Индексы таблицы ---
-    # ✅ Часто листаем транзакции по группе с сортировкой по дате — добавим составной индекс.
+    # --- Индексы ---
     __table_args__ = (
+        # листинги по группе/дате
         Index("ix_tx_group_date", "group_id", "date"),
+        # быстрые выборки для балансов по активным транзакциям
+        Index(
+            "ix_tx_group_currency_active",
+            "group_id",
+            "currency_code",
+            postgresql_where=text("is_deleted = false"),
+        ),
     )
 
-    # --- Связи (ORM relationships) ---
-    # Группа (удобно иметь явную связь)
+    # --- ORM-связи ---
     group = relationship("Group", backref="transactions", lazy="joined")
-
-    # Пользователь-автор (created_by)
     author = relationship("User", foreign_keys=[created_by], lazy="joined")
-
-    # Плательщик для расхода (paid_by)
     payer = relationship("User", foreign_keys=[paid_by], lazy="joined")
-
-    # Отправитель для перевода (transfer_from)
     transfer_from_user = relationship("User", foreign_keys=[transfer_from], lazy="joined")
-
-    # Категория расхода
     category = relationship("ExpenseCategory", backref="transactions", lazy="joined")
 
-    # Доли участников по транзакции
-    # Оставляем каскад, чтобы при удалении транзакции удалялись её доли.
     shares = relationship(
         "TransactionShare",
         back_populates="transaction",
         cascade="all, delete-orphan",
-        lazy="selectin",  # оптимизация N+1 по сравнению с lazy="joined" в списках
+        lazy="selectin",
     )
