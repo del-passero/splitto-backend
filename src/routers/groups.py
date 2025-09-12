@@ -20,7 +20,7 @@ from starlette import status
 from sqlalchemy.orm import Session, joinedload
 from sqlalchemy import func, select, cast
 from sqlalchemy.sql.sqltypes import DateTime
-from pydantic import BaseModel
+from pydantic import BaseModel, constr
 
 from src.db import get_db
 from src.models.group import Group, GroupStatus
@@ -528,6 +528,38 @@ def update_group_schedule(
             group.auto_archive = False
         else:
             group.auto_archive = bool(payload.auto_archive)
+
+    db.commit()
+    db.refresh(group)
+    return group
+
+class GroupUpdate(BaseModel):
+    name: Optional[constr(strip_whitespace=True, min_length=1, max_length=120)] = None
+    description: Optional[constr(strip_whitespace=True, max_length=500)] = None
+
+@router.patch("/{group_id}", response_model=GroupOut)
+def update_group_info(
+    group_id: int,
+    payload: GroupUpdate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_telegram_user),
+):
+    """
+    Частичное обновление названия/описания группы.
+    Доступ: только владелец. Для активной группы.
+    """
+    group = require_owner(db, group_id, current_user.id)
+    ensure_group_active(group)
+
+    fields_set = getattr(payload, "__fields_set__", getattr(payload, "model_fields_set", set()))
+
+    if "name" in fields_set and payload.name is not None:
+        group.name = payload.name
+
+    if "description" in fields_set:
+        # допускаем очистку описания: "" -> None
+        desc = payload.description
+        group.description = (desc if desc is not None and desc != "" else None)
 
     db.commit()
     db.refresh(group)
