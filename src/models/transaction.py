@@ -2,22 +2,6 @@
 # -----------------------------------------------------------------------------
 # МОДЕЛЬ: Transaction (SQLAlchemy)
 # -----------------------------------------------------------------------------
-# Назначение:
-#   - Храним расходы и переводы внутри группы.
-#   - Поддерживаем мультивалютность на уровне САМОЙ транзакции:
-#       • сумма amount — Decimal в БД (NUMERIC),
-#       • код валюты фиксируется в поле currency_code (ISO-4217, 3 буквы).
-#
-# Важные решения:
-#   • amount → NUMERIC(18,6) — чтобы не упираться в 2 знака и не ловить переполнения.
-#   • currency_code — строка длиной 3. NOT NULL и CHECK/FK включим миграцией.
-#   • Балансы/settle-up считаем ПО ОТДЕЛЬНОСТИ по каждой валюте (на уровне сервисов).
-#
-# Индексы:
-#   • (group_id, date) — частая сортировка/листинг.
-#   • (group_id, currency_code) WHERE is_deleted=false — быстрые выборки для балансов.
-#     (partial index задаётся через postgresql_where; потребует миграцию).
-# -----------------------------------------------------------------------------
 
 from __future__ import annotations
 
@@ -33,7 +17,7 @@ from sqlalchemy import (
     Boolean,
     JSON,
     Index,
-    text,  # для partial index (postgresql_where)
+    text,
 )
 from sqlalchemy.orm import relationship
 
@@ -43,7 +27,6 @@ from src.db import Base
 class Transaction(Base):
     __tablename__ = "transactions"
 
-    # --- Ключи/связи ---
     id = Column(Integer, primary_key=True, index=True)
 
     group_id = Column(
@@ -60,7 +43,6 @@ class Transaction(Base):
         comment="Пользователь, создавший транзакцию",
     )
 
-    # --- Тип и суммы ---
     type = Column(
         String,
         nullable=False,
@@ -73,14 +55,12 @@ class Transaction(Base):
         comment="Сумма транзакции (NUMERIC(18,6))",
     )
 
-    # Валюта транзакции (фиксируем на записи; дефолт берём из группы при создании, если не прислано)
     currency_code = Column(
         String(3),
-        nullable=True,  # станет NOT NULL после backfill миграцией
+        nullable=True,
         comment="Код валюты ISO-4217 (напр., 'USD'). Фиксируется на транзакции.",
     )
 
-    # --- Даты/описание ---
     date = Column(
         DateTime,
         nullable=False,
@@ -94,7 +74,6 @@ class Transaction(Base):
         comment="Комментарий/описание",
     )
 
-    # --- Реквизиты расхода/перевода ---
     category_id = Column(
         Integer,
         ForeignKey("expense_categories.id"),
@@ -128,7 +107,6 @@ class Transaction(Base):
         comment="Список получателей (user_id) для переводов; JSON-массив",
     )
 
-    # --- Техполя/чек ---
     created_at = Column(
         DateTime,
         nullable=False,
@@ -162,11 +140,8 @@ class Transaction(Base):
         comment="Результат OCR/парсинга чека (если есть)",
     )
 
-    # --- Индексы ---
     __table_args__ = (
-        # листинги по группе/дате
         Index("ix_tx_group_date", "group_id", "date"),
-        # быстрые выборки для балансов по активным транзакциям
         Index(
             "ix_tx_group_currency_active",
             "group_id",
@@ -175,7 +150,6 @@ class Transaction(Base):
         ),
     )
 
-    # --- ORM-связи ---
     group = relationship("Group", backref="transactions", lazy="joined")
     author = relationship("User", foreign_keys=[created_by], lazy="joined")
     payer = relationship("User", foreign_keys=[paid_by], lazy="joined")

@@ -2,15 +2,6 @@
 # -----------------------------------------------------------------------------
 # МОДЕЛЬ: TransactionShare (SQLAlchemy)
 # -----------------------------------------------------------------------------
-# Назначение:
-#   • Храним долю конкретного участника в транзакции.
-#   • Используется для индивидуальных сумм и долевого деления.
-#
-# Важные решения:
-#   • amount → NUMERIC(18,6) — точный десятичный тип для денег.
-#   • Уникальность (transaction_id, user_id) — один участник = одна запись доли.
-#   • Каскадное удаление при удалении транзакции.
-# -----------------------------------------------------------------------------
 
 from __future__ import annotations
 
@@ -46,14 +37,12 @@ class TransactionShare(Base):
         comment="ID участника группы",
     )
 
-    # Денежная доля участника (точный десятичный тип)
     amount = Column(
         Numeric(18, 6),
         nullable=False,
         comment="Сумма доли участника (NUMERIC(18,6))",
     )
 
-    # Количество долей (для split_type='shares'); может быть None
     shares = Column(Integer, nullable=True, comment="Количество долей (если split_type='shares')")
 
     __table_args__ = (
@@ -62,6 +51,5 @@ class TransactionShare(Base):
         Index("ix_txshare_user", "user_id"),
     )
 
-    # ORM-связи
     transaction = relationship("Transaction", back_populates="shares", lazy="joined")
     user = relationship("User", lazy="joined")

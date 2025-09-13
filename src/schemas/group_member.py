@@ -1,5 +1,6 @@
+# src/schemas/group_member.py
 from pydantic import BaseModel
-from .user import UserOut  # Импортируй схему пользователя (см. user.py)
+from .user import UserOut
 
 class GroupMemberCreate(BaseModel):
     group_id: int
@@ -8,6 +9,6 @@ class GroupMemberCreate(BaseModel):
 class GroupMemberOut(BaseModel):
     id: int
     group_id: int
-    user: UserOut              # <<< Вот это ключевое изменение!
+    user: UserOut
     class Config:
         from_attributes = True

@@ -2,19 +2,6 @@
 # -----------------------------------------------------------------------------
 # МОДЕЛЬ: Group (SQLAlchemy)
 # -----------------------------------------------------------------------------
-# Назначение:
-#   • Описывает группу пользователей для учёта общих расходов/переводов.
-#   • Управляет жизненным циклом (active/archived, soft-delete).
-#   • Хранит валюту по умолчанию для новых транзакций: default_currency_code.
-#
-# Важные решения:
-#   • Статус: active/archived — архив делает группу read-only.
-#   • soft-delete через deleted_at (скрываем из выборок по умолчанию).
-#   • default_currency_code — только дефолт; КАЖДАЯ транзакция хранит свою currency_code.
-#
-# Индексы:
-#   • status, deleted_at, (end_date, auto_archive), default_currency_code.
-# -----------------------------------------------------------------------------
 
 from __future__ import annotations
 
@@ -44,7 +31,6 @@ class GroupStatus(enum.Enum):
 class Group(Base):
     __tablename__ = "groups"
 
-    # Базовые поля
     id = Column(Integer, primary_key=True, index=True)
     name = Column(String, index=True)
     description = Column(String, default="")
@@ -52,7 +38,6 @@ class Group(Base):
     owner_id = Column(Integer, ForeignKey("users.id"))
     owner = relationship("User")
 
-    # Состояние/жизненный цикл
     status = Column(
         Enum(GroupStatus, name="group_status"),
         nullable=False,
@@ -87,7 +72,6 @@ class Group(Base):
         comment="Автоматически архивировать после end_date (если нет долгов)",
     )
 
-    # Валюта по умолчанию для НОВЫХ транзакций
     default_currency_code = Column(
         String(3),
         nullable=False,

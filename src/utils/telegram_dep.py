@@ -1,8 +1,6 @@
-# splitto/backend/src/utils/telegram_dep.py
+# src/utils/telegram_dep.py
 """
 Универсальные утилиты авторизации через Telegram WebApp initData.
-- validate_and_sync_user: валидация initData + ленивое обновление полей пользователя в БД
-- get_current_telegram_user: FastAPI-зависимость (не создаёт пользователя, только валидирует и обновляет)
 """
 
 import os
@@ -25,10 +23,6 @@ authenticator = TelegramAuthenticator(_auth_secret)
 
 
 def _normalize_lang(code: Optional[str]) -> str:
-    """
-    Схлопываем код языка до {ru,en,es}.
-    Если язык не пришёл (частый кейс для English) — используем 'en'.
-    """
     if not code:
         return "en"
     c = code.lower()
@@ -38,12 +32,6 @@ def _normalize_lang(code: Optional[str]) -> str:
 
 
 def _get_init_data_from_request(request: Request, body: Optional[dict]) -> Optional[str]:
-    """
-    Пытаемся достать initData:
-      - из JSON body (ключ 'initData')
-      - из заголовка 'x-telegram-initdata'
-      - из query (?init_data=...)
-    """
     if body and isinstance(body, dict):
         v = body.get("initData")
         if isinstance(v, str) and v.strip():
@@ -61,9 +49,6 @@ def _get_init_data_from_request(request: Request, body: Optional[dict]) -> Optio
 
 
 def _apply_user_fields_from_tg(u: User, tg_user) -> bool:
-    """
-    Копируем в User поля из Telegram-профиля. Возвращает True, если что-то изменилось.
-    """
     changed = False
 
     def upd(field: str, new_val):
@@ -87,7 +72,6 @@ def _apply_user_fields_from_tg(u: User, tg_user) -> bool:
     upd("language_code", language_code)
     upd("allows_write_to_pm", allows)
 
-    # Обновляем display name
     new_name = get_display_name(first_name=first_name, last_name=last_name, username=username, telegram_id=u.telegram_id)
     if getattr(u, "name", None) != new_name:
         u.name = new_name
@@ -97,9 +81,6 @@ def _apply_user_fields_from_tg(u: User, tg_user) -> bool:
 
 
 def validate_and_sync_user(init_data: str, db: Session, *, create_if_missing: bool) -> User:
-    """
-    Валидирует initData, находит/создаёт пользователя и лениво обновляет его поля.
-    """
     if not init_data:
         raise HTTPException(status_code=401, detail="initData is required")
 
@@ -116,7 +97,6 @@ def validate_and_sync_user(init_data: str, db: Session, *, create_if_missing: bo
     if not user:
         if not create_if_missing:
             raise HTTPException(status_code=401, detail="User is not registered")
-        # Создаём нового пользователя из Telegram-профиля
         user = User(
             telegram_id=telegram_id,
             first_name=getattr(tg_user, "first_name", None),
@@ -126,7 +106,8 @@ def validate_and_sync_user(init_data: str, db: Session, *, create_if_missing: bo
             language_code=_normalize_lang(getattr(tg_user, "language_code", None)),
             allows_write_to_pm=getattr(tg_user, "allows_write_to_pm", True),
         )
-        user.name = get_display_name(
+        from src.utils.user import get_display_name as _gd
+        user.name = _gd(
             first_name=user.first_name,
             last_name=user.last_name,
             username=user.username,
@@ -137,7 +118,6 @@ def validate_and_sync_user(init_data: str, db: Session, *, create_if_missing: bo
         db.refresh(user)
         return user
 
-    # Лениво обновляем поля существующего пользователя
     if _apply_user_fields_from_tg(user, tg_user):
         db.add(user)
         db.commit()
@@ -147,13 +127,6 @@ def validate_and_sync_user(init_data: str, db: Session, *, create_if_missing: bo
 
 
 async def get_current_telegram_user(request: Request, db: Session = Depends(get_db)) -> User:
-    """
-    Зависимость для защищённых ручек:
-    - достаёт initData из запроса
-    - валидирует
-    - находит существующего пользователя
-    - лениво обновляет его поля (включая language_code -> с фолбэком на 'en')
-    """
     body = None
     if request.method in {"POST", "PUT", "PATCH"}:
         try:
@@ -171,12 +144,7 @@ async def get_current_telegram_user(request: Request, db: Session = Depends(get_
     return validate_and_sync_user(init_data, db, create_if_missing=False)
 
 
-# --- ДОБАВЛЕНО: зависимость «создай, если нет» (нужна для акцепта группового инвайта) ---
 async def get_current_telegram_user_or_create(request: Request, db: Session = Depends(get_db)) -> User:
-    """
-    То же самое, что get_current_telegram_user, но с create_if_missing=True.
-    Использовать там, где новый пользователь заходит в приложение впервые по инвайт-ссылке.
-    """
     body = None
     if request.method in {"POST", "PUT", "PATCH"}:
         try:

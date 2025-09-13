@@ -7,12 +7,6 @@ from src.db import Base
 class Friend(Base):
     """
     Модель связи дружбы между двумя пользователями.
-
-    Особенности:
-        - Дружба всегда двусторонняя: на каждую дружбу есть две записи (user_id → friend_id и friend_id → user_id).
-        - created_at, updated_at для аудита.
-        - Связи на оба объекта User (user, friend).
-        - Можно скрыть друга, если поле hidden=True.
     """
     __tablename__ = "friends"
 
@@ -21,8 +15,7 @@ class Friend(Base):
     friend_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
     created_at = Column(DateTime, nullable=False, default=func.now())
     updated_at = Column(DateTime, nullable=False, default=func.now(), onupdate=func.now())
-    hidden = Column(Boolean, default=False)  # Скрыт ли друг в списке (True — скрыт, False — виден)
-    # Можно добавить status (например, pending, blocked и т.д.), если понадобится расширенная логика
+    hidden = Column(Boolean, default=False)
 
     __table_args__ = (UniqueConstraint('user_id', 'friend_id', name='_user_friend_uc'),)
 
