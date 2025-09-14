@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 from decimal import Decimal
-from typing import Optional, Set, List, Dict
+from typing import Callable, Iterable, Optional, Set, List, Dict
 
 from fastapi import HTTPException
 from starlette import status
@@ -15,9 +15,6 @@ from ..models.group import Group, GroupStatus
 from ..models.group_member import GroupMember
 from ..models.group_category import GroupCategory
 from ..models.transaction import Transaction
-
-# ВАЖНО: используем готовую утилиту расчёта балансов из utils/balance.py
-from .balance import calculate_group_balances_by_currency
 
 
 # =========================
@@ -147,16 +144,66 @@ def load_group_transactions(db: Session, group_id: int) -> List[Transaction]:
 # ПРОВЕРКИ ДОЛГОВ / БАЛАНСОВ
 # =========================
 
+def _D(x) -> Decimal:
+    return x if isinstance(x, Decimal) else Decimal(str(x))
+
+
 def _nets_by_currency_for_active(
     db: Session,
     group_id: int,
 ) -> Dict[str, Dict[int, Decimal]]:
     """
     Возвращает net-балансы по валютам ТОЛЬКО для активных участников группы.
+    Знак согласован со вкладкой «Баланс»:
+      • net > 0 — пользователю ДОЛЖНЫ;
+      • net < 0 — он ДОЛЖЕН.
+    ВАЖНО: учитываем только взаимодействия МЕЖДУ активными участниками.
     """
-    member_ids = get_group_member_ids(db, group_id)
+    member_ids = set(get_group_member_ids(db, group_id))
     txs = load_group_transactions(db, group_id)
-    return calculate_group_balances_by_currency(txs, member_ids)
+
+    nets: Dict[str, Dict[int, Decimal]] = {}
+
+    for tx in txs:
+        code = (tx.currency_code or "").upper() or "XXX"
+        if code not in nets:
+            nets[code] = {uid: Decimal("0") for uid in member_ids}
+
+        # Расходы: каждый (кроме плательщика) должен плательщику свою долю.
+        if tx.type == "expense":
+            payer = tx.paid_by
+            if payer is None or payer not in member_ids:
+                continue
+            for share in tx.shares:
+                uid = share.user_id
+                if uid == payer:
+                    continue
+                if uid not in member_ids:
+                    # Доля неактивного участника игнорируется для проверок на выход/удаление.
+                    continue
+                amount = _D(getattr(share, "amount", 0))
+                nets[code][uid] -= amount      # участник должен
+                nets[code][payer] += amount    # плательщику должны
+
+        # Переводы: это ФАКТИЧЕСКИЙ РАСЧЁТ ДОЛГА.
+        # Денежный перевод A -> B на сумму X уменьшает долг A и уменьшает требование B.
+        elif tx.type == "transfer":
+            sender = getattr(tx, "transfer_from", None)
+            receivers: Iterable[int] = getattr(tx, "transfer_to", []) or []
+            amount = _D(getattr(tx, "amount", 0))
+
+            if sender is None or sender not in member_ids or amount == 0:
+                continue
+
+            for rid in receivers:
+                if rid not in member_ids or rid == sender:
+                    continue
+                nets[code][sender] += amount   # отправитель "меньше должен"
+                nets[code][rid]    -= amount   # получателю "меньше должны"
+
+        # Другие типы — не учитываем
+
+    return nets
 
 
 def has_group_debts(
@@ -167,19 +214,16 @@ def has_group_debts(
 ) -> bool:
     """
     Проверка наличия долгов в группе среди АКТИВНЫХ участников.
-    Работает мультивалютно (без межвалютного неттинга) — достаточно,
-    чтобы по ЛЮБОЙ валюте был ненулевой net > precision.
+    Мультивалютно (без межвалютного неттинга): достаточно,
+    чтобы по ЛЮБОЙ валюте у ЛЮБОГО участника |net| > precision.
     """
-    eps = Decimal(str(precision))
-    if eps < Decimal("0"):
-        eps = -eps
-
+    eps = _D(precision).copy_abs()
     nets = _nets_by_currency_for_active(db, group_id)
     if not nets:
         return False
 
-    for net_by_user in nets.values():
-        for value in net_by_user.values():
+    for per_ccy in nets.values():
+        for value in per_ccy.values():
             if value.copy_abs() > eps:
                 return True
     return False
@@ -194,7 +238,7 @@ def _member_nets(
     Возвращает словарь {currency_code: net} КОНКРЕТНОГО активного участника.
     Если пользователь не активен в группе — пустой словарь.
     """
-    member_ids = get_group_member_ids(db, group_id)
+    member_ids = set(get_group_member_ids(db, group_id))
     if user_id not in member_ids:
         return {}
     nets = _nets_by_currency_for_active(db, group_id)
@@ -214,14 +258,11 @@ def ensure_member_can_leave(
     """
     Разрешаем выход из группы, если личный баланс пользователя ~ 0
     по КАЖДОЙ валюте среди активных участников.
-    Это устраняет ложные срабатывания, когда в расчёт попадали
-    удалённые/неактивные участники.
     """
-    # Убедимся, что пользователь сейчас активный участник и группа активна
     group = require_membership(db, group_id, user_id)
     ensure_group_active(group)
 
-    eps = Decimal(str(precision)).copy_abs()
+    eps = _D(precision).copy_abs()
     nets = _member_nets(db, group_id, user_id)
     for value in nets.values():
         if value.copy_abs() > eps:
@@ -241,7 +282,7 @@ def ensure_member_can_be_removed(
     """
     Разрешаем удаление участника, если его личный баланс ~ 0 по всем валютам.
     """
-    eps = Decimal(str(precision)).copy_abs()
+    eps = _D(precision).copy_abs()
     nets = _member_nets(db, group_id, target_user_id)
     for value in nets.values():
         if value.copy_abs() > eps:
@@ -259,10 +300,9 @@ def ensure_group_can_be_deleted(
 ) -> None:
     """
     Разрешаем удаление группы, если по АКТИВНЫМ участникам нет долгов.
-    Больше не падает 500 из-за неверных импортов — используем штатный
-    calculate_group_balances_by_currency.
     """
-    group = get_group_or_404(db, group_id, include_deleted=True)
+    # группа может быть уже помечена на удаление — достаем без фильтра
+    get_group_or_404(db, group_id, include_deleted=True)
 
     if has_group_debts(db, group_id, precision=precision):
         raise HTTPException(
@@ -270,6 +310,4 @@ def ensure_group_can_be_deleted(
             detail="Group has unsettled balances and cannot be deleted.",
         )
 
-    if group.deleted_at is not None:
-        # Уже удалена — считаем конфликтом
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Group is already deleted")
+    # Если сюда дошли — долгов среди активных участников нет, можно удалять.
