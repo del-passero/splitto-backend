@@ -6,6 +6,11 @@
 #   • Мультивалютность без конверсии: считаем по каждой валюте отдельно.
 #   • Нет межвалютного неттинга.
 #   • Внутренние расчёты — Decimal, округление отдаём на уровень роутера (по decimals).
+#   • Семантика net:
+#       net > 0 — пользователю ДОЛЖНЫ; net < 0 — он ДОЛЖЕН.
+#   • ВАЖНО: перевод (transfer) — это ПОГАШЕНИЕ долга:
+#       sender -> receiver на X уменьшает долг sender перед receiver на X,
+#       что эквивалентно добавлению «анти-долга» receiver -> sender на X.
 # -----------------------------------------------------------------------------
 
 from __future__ import annotations
@@ -32,10 +37,16 @@ def calculate_group_balances_by_currency(
     Возвращает словарь по валютам:
       { "USD": {user_id: net, ...}, "EUR": {...}, ... }
     net > 0 — пользователю должны; net < 0 — он должен.
+
+    Интерпретация матрицы debts[ccy][a][b] = сколько a ДОЛЖЕН b в валюте ccy.
+    Тогда нетто считается как входящие минус исходящие:
+        net[a] += debts[b][a] - debts[a][b]
     """
     member_ids = list(member_ids)
     # debts[ccy][a][b] = сколько a должен b в валюте ccy
-    debts: Dict[str, Dict[int, Dict[int, Decimal]]] = defaultdict(lambda: defaultdict(lambda: defaultdict(Decimal)))
+    debts: Dict[str, Dict[int, Dict[int, Decimal]]] = defaultdict(
+        lambda: defaultdict(lambda: defaultdict(Decimal))
+    )
 
     for tx in transactions:
         code = (tx.currency_code or "").upper()
@@ -49,15 +60,26 @@ def calculate_group_balances_by_currency(
                 continue
             for share in tx.shares:
                 if share.user_id != payer:
+                    # участник share.user_id должен плательщику payer
                     debts[code][share.user_id][payer] += _ensure_decimal(share.amount)
+
         elif tx.type == "transfer":
+            # ПОГАШЕНИЕ долга: sender -> receiver на amount
+            # эквивалентно добавлению «анти-долга» receiver -> sender на amount.
             sender = tx.transfer_from
             if sender is None:
                 continue
             receivers = tx.transfer_to or []
+            amount = _ensure_decimal(getattr(tx, "amount", 0))
+            if amount == 0:
+                continue
             for receiver_id in receivers:
                 if sender != receiver_id:
-                    debts[code][sender][receiver_id] += _ensure_decimal(tx.amount)
+                    # было (НЕПРАВИЛЬНО): debts[code][sender][receiver_id] += amount
+                    # стало (ПРАВИЛЬНО):   debts[code][receiver_id][sender] += amount
+                    debts[code][receiver_id][sender] += amount
+
+        # другие типы не учитываем
 
     out: Dict[str, Dict[int, Decimal]] = {}
     for code, matrix in debts.items():
@@ -85,8 +107,14 @@ def greedy_settle_up_single_currency(
 
     eps = Decimal("1").scaleb(-max(decimals, 2))  # малый порог
 
-    creditors = sorted([(uid, bal) for uid, bal in net_balance.items() if bal > eps], key=lambda x: -x[1])
-    debtors = sorted([(uid, bal) for uid, bal in net_balance.items() if bal < -eps], key=lambda x: x[1])
+    creditors = sorted(
+        [(uid, bal) for uid, bal in net_balance.items() if bal > eps],
+        key=lambda x: -x[1],
+    )
+    debtors = sorted(
+        [(uid, bal) for uid, bal in net_balance.items() if bal < -eps],
+        key=lambda x: x[1],
+    )
 
     settlements: List[Dict] = []
     i, j = 0, 0
@@ -96,8 +124,10 @@ def greedy_settle_up_single_currency(
         amount = min(-debt, credit)
         amount = _round_amount(amount)
         if amount <= Decimal("0"):
-            if -debt <= eps: i += 1
-            if credit <= eps: j += 1
+            if -debt <= eps:
+                i += 1
+            if credit <= eps:
+                j += 1
             continue
 
         item = {
@@ -111,7 +141,9 @@ def greedy_settle_up_single_currency(
 
         debtors[i] = (debtor_id, debt + amount)
         creditors[j] = (creditor_id, credit - amount)
-        if abs(debtors[i][1]) <= eps: i += 1
-        if abs(creditors[j][1]) <= eps: j += 1
+        if abs(debtors[i][1]) <= eps:
+            i += 1
+        if abs(creditors[j][1]) <= eps:
+            j += 1
 
     return settlements
