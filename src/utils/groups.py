@@ -82,6 +82,11 @@ def get_group_member_ids(db: Session, group_id: int) -> List[int]:
 
 
 def load_group_transactions(db: Session, group_id: int) -> list[Transaction]:
+    """
+    Загружает активные транзакции группы с подгруженными долями.
+    ВНИМАНИЕ: используется joinedload на коллекции, поэтому
+    необходимо вызвать .unique() на Result перед .scalars().
+    """
     stmt = (
         select(Transaction)
         .where(
@@ -91,7 +96,8 @@ def load_group_transactions(db: Session, group_id: int) -> list[Transaction]:
         .options(joinedload(Transaction.shares))
         .order_by(Transaction.date.asc(), Transaction.id.asc())
     )
-    return list(db.scalars(stmt).all())
+    # Критическая правка: execute(...).unique().scalars().all()
+    return db.execute(stmt).unique().scalars().all()
 
 
 def has_group_debts(
