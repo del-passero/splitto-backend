@@ -3,8 +3,8 @@
 
 from __future__ import annotations
 
-from typing import Callable, Iterable, Optional, Set, List
-from datetime import datetime
+from decimal import Decimal
+from typing import Optional, Set, List, Dict
 
 from fastapi import HTTPException
 from starlette import status
@@ -16,6 +16,13 @@ from ..models.group_member import GroupMember
 from ..models.group_category import GroupCategory
 from ..models.transaction import Transaction
 
+# ВАЖНО: используем готовую утилиту расчёта балансов из utils/balance.py
+from .balance import calculate_group_balances_by_currency
+
+
+# =========================
+# БАЗОВЫЕ ГАРДЫ / ЗАГРУЗКИ
+# =========================
 
 def get_group_or_404(db: Session, group_id: int, *, include_deleted: bool = False) -> Group:
     stmt = select(Group).where(Group.id == group_id)
@@ -68,6 +75,22 @@ def ensure_group_active(group: Group) -> None:
     ensure_group_not_archived(group)
 
 
+def guard_mutation_for_member(db: Session, group_id: int, user_id: int) -> Group:
+    group = require_membership(db, group_id, user_id)
+    ensure_group_active(group)
+    return group
+
+
+def guard_mutation_for_owner(db: Session, group_id: int, user_id: int) -> Group:
+    group = require_owner(db, group_id, user_id)
+    ensure_group_active(group)
+    return group
+
+
+# =========================
+# ЧЛЕНЫ ГРУППЫ / КАТЕГОРИИ
+# =========================
+
 def get_group_member_ids(db: Session, group_id: int) -> List[int]:
     """
     Возвращает только активные membership'ы.
@@ -79,61 +102,6 @@ def get_group_member_ids(db: Session, group_id: int) -> List[int]:
         )
     ).all()
     return [uid for (uid,) in rows]
-
-
-def load_group_transactions(db: Session, group_id: int) -> list[Transaction]:
-    """
-    Загружает активные транзакции группы с подгруженными долями.
-    ВНИМАНИЕ: используется joinedload на коллекции, поэтому
-    необходимо вызвать .unique() на Result перед .scalars().
-    """
-    stmt = (
-        select(Transaction)
-        .where(
-            Transaction.group_id == group_id,
-            Transaction.is_deleted.is_(False),
-        )
-        .options(joinedload(Transaction.shares))
-        .order_by(Transaction.date.asc(), Transaction.id.asc())
-    )
-    # Критическая правка: execute(...).unique().scalars().all()
-    return db.execute(stmt).unique().scalars().all()
-
-
-def has_group_debts(
-    db: Session,
-    group_id: int,
-    *,
-    precision: float = 0.01,
-    calc_balances: Optional[Callable[..., dict[int, float]]] = None,
-) -> bool:
-    """
-    Историческая проверка (single-currency). Оставляем как есть для архивирования группы.
-    """
-    member_ids = get_group_member_ids(db, group_id)
-    txs = load_group_transactions(db, group_id)
-
-    balances: Optional[dict[int, float]] = None
-    if calc_balances is not None:
-        balances = calc_balances(member_ids, txs)
-    if balances is None:
-        try:
-            from ..balance import calculate_group_balances as _calc  # type: ignore
-            balances = _calc(member_ids, txs)
-        except Exception:
-            try:
-                from ..utils.balance import calculate_group_balances as _calc  # type: ignore
-                balances = _calc(member_ids, txs)
-            except Exception:
-                raise RuntimeError(
-                    "Не удалось импортировать calculate_group_balances. "
-                    "Передайте calc_balances=... или проверьте путь импорта."
-                )
-
-    for value in balances.values():
-        if abs(value) > precision:
-            return True
-    return False
 
 
 def get_allowed_category_ids(db: Session, group_id: int) -> Optional[Set[int]]:
@@ -153,13 +121,155 @@ def is_category_allowed(allowed_ids: Optional[Set[int]], category_id: Optional[i
     return category_id in allowed_ids
 
 
-def guard_mutation_for_member(db: Session, group_id: int, user_id: int) -> Group:
+# =========================
+# ТРАНЗАКЦИИ
+# =========================
+
+def load_group_transactions(db: Session, group_id: int) -> List[Transaction]:
+    """
+    Загружает активные транзакции группы с подгруженными долями.
+    Для joinedload коллекций используем .unique() перед .scalars()
+    (SQLAlchemy 2.x) чтобы убрать дубли.
+    """
+    stmt = (
+        select(Transaction)
+        .where(
+            Transaction.group_id == group_id,
+            Transaction.is_deleted.is_(False),
+        )
+        .options(joinedload(Transaction.shares))
+        .order_by(Transaction.date.asc(), Transaction.id.asc())
+    )
+    return db.execute(stmt).unique().scalars().all()
+
+
+# =========================
+# ПРОВЕРКИ ДОЛГОВ / БАЛАНСОВ
+# =========================
+
+def _nets_by_currency_for_active(
+    db: Session,
+    group_id: int,
+) -> Dict[str, Dict[int, Decimal]]:
+    """
+    Возвращает net-балансы по валютам ТОЛЬКО для активных участников группы.
+    """
+    member_ids = get_group_member_ids(db, group_id)
+    txs = load_group_transactions(db, group_id)
+    return calculate_group_balances_by_currency(txs, member_ids)
+
+
+def has_group_debts(
+    db: Session,
+    group_id: int,
+    *,
+    precision: float = 0.01,
+) -> bool:
+    """
+    Проверка наличия долгов в группе среди АКТИВНЫХ участников.
+    Работает мультивалютно (без межвалютного неттинга) — достаточно,
+    чтобы по ЛЮБОЙ валюте был ненулевой net > precision.
+    """
+    eps = Decimal(str(precision))
+    if eps < Decimal("0"):
+        eps = -eps
+
+    nets = _nets_by_currency_for_active(db, group_id)
+    if not nets:
+        return False
+
+    for net_by_user in nets.values():
+        for value in net_by_user.values():
+            if value.copy_abs() > eps:
+                return True
+    return False
+
+
+def _member_nets(
+    db: Session,
+    group_id: int,
+    user_id: int,
+) -> Dict[str, Decimal]:
+    """
+    Возвращает словарь {currency_code: net} КОНКРЕТНОГО активного участника.
+    Если пользователь не активен в группе — пустой словарь.
+    """
+    member_ids = get_group_member_ids(db, group_id)
+    if user_id not in member_ids:
+        return {}
+    nets = _nets_by_currency_for_active(db, group_id)
+    out: Dict[str, Decimal] = {}
+    for code, per_user in nets.items():
+        out[code] = per_user.get(user_id, Decimal("0"))
+    return out
+
+
+def ensure_member_can_leave(
+    db: Session,
+    group_id: int,
+    user_id: int,
+    *,
+    precision: float = 0.01,
+) -> None:
+    """
+    Разрешаем выход из группы, если личный баланс пользователя ~ 0
+    по КАЖДОЙ валюте среди активных участников.
+    Это устраняет ложные срабатывания, когда в расчёт попадали
+    удалённые/неактивные участники.
+    """
+    # Убедимся, что пользователь сейчас активный участник и группа активна
     group = require_membership(db, group_id, user_id)
     ensure_group_active(group)
-    return group
+
+    eps = Decimal(str(precision)).copy_abs()
+    nets = _member_nets(db, group_id, user_id)
+    for value in nets.values():
+        if value.copy_abs() > eps:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="You cannot leave the group while you still have unsettled balance.",
+            )
 
 
-def guard_mutation_for_owner(db: Session, group_id: int, user_id: int) -> Group:
-    group = require_owner(db, group_id, user_id)
-    ensure_group_active(group)
-    return group
+def ensure_member_can_be_removed(
+    db: Session,
+    group_id: int,
+    target_user_id: int,
+    *,
+    precision: float = 0.01,
+) -> None:
+    """
+    Разрешаем удаление участника, если его личный баланс ~ 0 по всем валютам.
+    """
+    eps = Decimal(str(precision)).copy_abs()
+    nets = _member_nets(db, group_id, target_user_id)
+    for value in nets.values():
+        if value.copy_abs() > eps:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Member has unsettled balance and cannot be removed.",
+            )
+
+
+def ensure_group_can_be_deleted(
+    db: Session,
+    group_id: int,
+    *,
+    precision: float = 0.01,
+) -> None:
+    """
+    Разрешаем удаление группы, если по АКТИВНЫМ участникам нет долгов.
+    Больше не падает 500 из-за неверных импортов — используем штатный
+    calculate_group_balances_by_currency.
+    """
+    group = get_group_or_404(db, group_id, include_deleted=True)
+
+    if has_group_debts(db, group_id, precision=precision):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Group has unsettled balances and cannot be deleted.",
+        )
+
+    if group.deleted_at is not None:
+        # Уже удалена — считаем конфликтом
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Group is already deleted")
