@@ -23,6 +23,13 @@ from src.schemas.expense_category import ExpenseCategoryForTxOut
 # Масштаб округления определяется Currency.decimals на уровне сервиса.
 Money = condecimal(max_digits=18, ge=0)
 
+class UserMiniOut(BaseModel):
+    id: int
+    first_name: Optional[str] = None
+    last_name: Optional[str] = None
+    username: Optional[str] = None
+    photo_url: Optional[str] = None
+    name: Optional[str] = None
 
 class TransactionBase(BaseModel):
     group_id: int
@@ -92,6 +99,9 @@ class TransactionOut(TransactionBase):
 
     category: Optional[ExpenseCategoryForTxOut] = None
     shares: List[TransactionShareOut] = Field(default_factory=list)
+
+    # Доп.поле: краткие профили всех задействованных пользователей
+    related_users: List[UserMiniOut] = Field(default_factory=list)
 
     class Config:
         from_attributes = True

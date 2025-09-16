@@ -16,7 +16,7 @@
 from __future__ import annotations
 
 from decimal import Decimal, ROUND_HALF_UP
-from typing import List, Optional, Dict
+from typing import List, Optional, Dict, Iterable
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from starlette import status
@@ -27,6 +27,8 @@ from src.db import get_db
 from src.models.transaction import Transaction
 from src.models.transaction_share import TransactionShare
 from src.models.currency import Currency
+from src.models.user import User
+from src.models.group_member import GroupMember
 from src.schemas.transaction import TransactionCreate, TransactionUpdate, TransactionOut
 
 from src.utils.telegram_dep import get_current_telegram_user
@@ -58,6 +60,115 @@ def get_currency_decimals(db: Session, code: str) -> int:
     if not cur:
         raise HTTPException(status_code=404, detail="Currency not found")
     return int(cur.decimals or 2)
+
+def _collect_tx_participant_ids(tx: Transaction) -> set[int]:
+    """
+    Собираем участников транзакции (без created_by):
+      • expense: paid_by + все из shares
+      • transfer: transfer_from + все из transfer_to
+    """
+    ids: set[int] = set()
+    if tx.type == "expense":
+        if tx.paid_by is not None:
+            ids.add(int(tx.paid_by))
+        for s in (tx.shares or []):
+            if s.user_id is not None:
+                ids.add(int(s.user_id))
+    elif tx.type == "transfer":
+        if tx.transfer_from is not None:
+            ids.add(int(tx.transfer_from))
+        for uid in (tx.transfer_to or []) or []:
+            ids.add(int(uid))
+    return ids
+
+def _inactive_participants(db: Session, group_id: int, user_ids: Iterable[int]) -> List[dict]:
+    """Возвращает список пользователей (dict), которые НЕ являются активными участниками группы."""
+    ids = {int(u) for u in user_ids if u is not None}
+    if not ids:
+        return []
+    active_ids = set(
+        x[0]
+        for x in db.query(GroupMember.user_id)
+        .filter(
+            GroupMember.group_id == group_id,
+            GroupMember.deleted_at.is_(None),
+            GroupMember.user_id.in_(ids),
+        )
+        .all()
+    )
+    missing = ids - active_ids
+    if not missing:
+        return []
+    users = (
+        db.query(User)
+        .filter(User.id.in_(missing))
+        .all()
+    )
+    # Минимальный публичный профиль
+    out = []
+    for u in users:
+        out.append({
+            "id": int(u.id),
+            "first_name": getattr(u, "first_name", None),
+            "last_name": getattr(u, "last_name", None),
+            "username": getattr(u, "username", None),
+            "photo_url": getattr(u, "photo_url", None),
+            "name": getattr(u, "name", None),
+        })
+    return out
+
+def _ensure_no_inactive_or_409(db: Session, tx: Transaction):
+    """Если среди участников транзакции есть те, кто уже не в группе — 409."""
+    parts = _collect_tx_participant_ids(tx)
+    inactive = _inactive_participants(db, tx.group_id, parts)
+    if inactive:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "tx_has_inactive_participants",
+                "inactive_participants": inactive,
+            },
+        )
+
+def _attach_related_users(db: Session, tx: Transaction):
+    """
+    Доп.поле на лету: tx.related_users — массив кратких профилей всех задействованных user_id.
+    Это нужно фронту, чтобы всегда показать имя/аватар, даже если пользователь уже не в группе.
+    """
+    user_ids = set()
+    # creator
+    if tx.created_by is not None:
+        user_ids.add(int(tx.created_by))
+    # expense
+    if tx.type == "expense":
+        if tx.paid_by is not None:
+            user_ids.add(int(tx.paid_by))
+        for s in tx.shares or []:
+            if s.user_id is not None:
+                user_ids.add(int(s.user_id))
+    # transfer
+    if tx.type == "transfer":
+        if tx.transfer_from is not None:
+            user_ids.add(int(tx.transfer_from))
+        for uid in (tx.transfer_to or []) or []:
+            user_ids.add(int(uid))
+
+    if not user_ids:
+        setattr(tx, "related_users", [])
+        return
+
+    users = db.query(User).filter(User.id.in_(user_ids)).all()
+    brief = []
+    for u in users:
+        brief.append({
+            "id": int(u.id),
+            "first_name": getattr(u, "first_name", None),
+            "last_name": getattr(u, "last_name", None),
+            "username": getattr(u, "username", None),
+            "photo_url": getattr(u, "photo_url", None),
+            "name": getattr(u, "name", None),
+        })
+    setattr(tx, "related_users", brief)
 
 # ===== Эндпоинты =====
 
@@ -112,6 +223,10 @@ def get_transactions(
         .all()
     )
 
+    # прикрепляем related_users
+    for it in items:
+        _attach_related_users(db, it)
+
     if response is not None:
         response.headers["X-Total-Count"] = str(total)
     return items
@@ -139,6 +254,7 @@ def get_transaction(
         raise HTTPException(status_code=404, detail="Транзакция не найдена")
 
     require_membership(db, tx.group_id, current_user.id)
+    _attach_related_users(db, tx)
     return tx
 
 
@@ -234,6 +350,7 @@ def create_transaction(
         .filter(Transaction.id == new_tx.id)
         .first()
     )
+    _attach_related_users(db, new_tx)
     return new_tx
 
 
@@ -253,9 +370,13 @@ def update_transaction(
     if not tx:
         raise HTTPException(status_code=404, detail="Транзакция не найдена")
 
+    # Любой активный участник группы может редактировать
     require_membership(db, tx.group_id, current_user.id)
     group = guard_mutation_for_member(db, tx.group_id, current_user.id)
     ensure_group_active(group)
+
+    # Блокируем правки, если в транзакции есть «вышедшие из группы»
+    _ensure_no_inactive_or_409(db, tx)
 
     # Тип менять нельзя
     if patch.type and patch.type != tx.type:
@@ -358,6 +479,7 @@ def update_transaction(
         .filter(Transaction.id == tx.id)
         .first()
     )
+    _attach_related_users(db, tx)
     return tx
 
 
@@ -371,24 +493,15 @@ def delete_transaction(
     if not tx:
         raise HTTPException(status_code=404, detail="Транзакция не найдена")
 
+    # Любой активный участник может удалить
     group = require_membership(db, tx.group_id, current_user.id)
     ensure_group_active(group)
 
     if tx.is_deleted:
         return Response(status_code=status.HTTP_204_NO_CONTENT)
 
-    # Права на удаление:
-    # expense  -> author (created_by) ИЛИ payer (paid_by)
-    # transfer -> author (created_by) ИЛИ sender (transfer_from)
-    allowed_ids = {tx.created_by}
-    if tx.type == "expense" and tx.paid_by is not None:
-        allowed_ids.add(tx.paid_by)
-    if tx.type == "transfer" and tx.transfer_from is not None:
-        allowed_ids.add(tx.transfer_from)
-
-    if current_user.id not in allowed_ids:
-        code = "tx_delete_forbidden_expense" if tx.type == "expense" else "tx_delete_forbidden_transfer"
-        raise HTTPException(status_code=403, detail={"code": code})
+    # Блокируем удаление, если в транзакции есть «вышедшие из группы»
+    _ensure_no_inactive_or_409(db, tx)
 
     tx.is_deleted = True
     db.commit()
