@@ -18,18 +18,12 @@ from pydantic import BaseModel, Field, validator, condecimal
 
 from src.schemas.transaction_share import TransactionShareOut, TransactionShareBase
 from src.schemas.expense_category import ExpenseCategoryForTxOut
+from src.schemas.user import UserOut
 
 # Денежное поле без фиксированного количества знаков после запятой.
 # Масштаб округления определяется Currency.decimals на уровне сервиса.
 Money = condecimal(max_digits=18, ge=0)
 
-class UserMiniOut(BaseModel):
-    id: int
-    first_name: Optional[str] = None
-    last_name: Optional[str] = None
-    username: Optional[str] = None
-    photo_url: Optional[str] = None
-    name: Optional[str] = None
 
 class TransactionBase(BaseModel):
     group_id: int
@@ -100,8 +94,10 @@ class TransactionOut(TransactionBase):
     category: Optional[ExpenseCategoryForTxOut] = None
     shares: List[TransactionShareOut] = Field(default_factory=list)
 
-    # Доп.поле: краткие профили всех задействованных пользователей
-    related_users: List[UserMiniOut] = Field(default_factory=list)
+    # ДОБАВЛЕНО: список участников транзакции (включая тех, кто уже не в группе).
+    # Нужен фронтенду для отображения имени/аватара на карточке и в редакторе.
+    related_users: List[UserOut] = Field(default_factory=list)
 
     class Config:
         from_attributes = True
+

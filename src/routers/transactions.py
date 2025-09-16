@@ -16,7 +16,7 @@
 from __future__ import annotations
 
 from decimal import Decimal, ROUND_HALF_UP
-from typing import List, Optional, Dict, Iterable
+from typing import List, Optional, Dict, Iterable, Set
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from starlette import status
@@ -28,8 +28,8 @@ from src.models.transaction import Transaction
 from src.models.transaction_share import TransactionShare
 from src.models.currency import Currency
 from src.models.user import User
-from src.models.group_member import GroupMember
 from src.schemas.transaction import TransactionCreate, TransactionUpdate, TransactionOut
+from src.schemas.user import UserOut
 
 from src.utils.telegram_dep import get_current_telegram_user
 from src.utils.groups import (
@@ -61,13 +61,13 @@ def get_currency_decimals(db: Session, code: str) -> int:
         raise HTTPException(status_code=404, detail="Currency not found")
     return int(cur.decimals or 2)
 
-def _collect_tx_participant_ids(tx: Transaction) -> set[int]:
+def _involved_user_ids(tx: Transaction) -> Set[int]:
     """
-    Собираем участников транзакции (без created_by):
-      • expense: paid_by + все из shares
-      • transfer: transfer_from + все из transfer_to
+    Возвращает множество участников транзакции (для пометок/проверок):
+      • expense: paid_by + все shares.user_id;
+      • transfer: transfer_from + все из transfer_to.
     """
-    ids: set[int] = set()
+    ids: Set[int] = set()
     if tx.type == "expense":
         if tx.paid_by is not None:
             ids.add(int(tx.paid_by))
@@ -77,98 +77,38 @@ def _collect_tx_participant_ids(tx: Transaction) -> set[int]:
     elif tx.type == "transfer":
         if tx.transfer_from is not None:
             ids.add(int(tx.transfer_from))
-        for uid in (tx.transfer_to or []) or []:
-            ids.add(int(uid))
+        for uid in (tx.transfer_to or []):
+            if uid is not None:
+                ids.add(int(uid))
     return ids
 
-def _inactive_participants(db: Session, group_id: int, user_ids: Iterable[int]) -> List[dict]:
-    """Возвращает список пользователей (dict), которые НЕ являются активными участниками группы."""
-    ids = {int(u) for u in user_ids if u is not None}
+def _attach_related_users(db: Session, tx: Transaction) -> None:
+    """
+    Подмешивает к ORM-объекту поле `related_users`: список User по участникам транзакции.
+    Это нужно, чтобы фронтенд мог показать имена/аватары для вышедших из группы пользователей.
+    """
+    ids = _involved_user_ids(tx)
     if not ids:
-        return []
-    active_ids = set(
-        x[0]
-        for x in db.query(GroupMember.user_id)
-        .filter(
-            GroupMember.group_id == group_id,
-            GroupMember.deleted_at.is_(None),
-            GroupMember.user_id.in_(ids),
-        )
-        .all()
-    )
-    missing = ids - active_ids
-    if not missing:
-        return []
-    users = (
-        db.query(User)
-        .filter(User.id.in_(missing))
-        .all()
-    )
-    # Минимальный публичный профиль
-    out = []
-    for u in users:
-        out.append({
-            "id": int(u.id),
-            "first_name": getattr(u, "first_name", None),
-            "last_name": getattr(u, "last_name", None),
-            "username": getattr(u, "username", None),
-            "photo_url": getattr(u, "photo_url", None),
-            "name": getattr(u, "name", None),
-        })
-    return out
-
-def _ensure_no_inactive_or_409(db: Session, tx: Transaction):
-    """Если среди участников транзакции есть те, кто уже не в группе — 409."""
-    parts = _collect_tx_participant_ids(tx)
-    inactive = _inactive_participants(db, tx.group_id, parts)
-    if inactive:
-        raise HTTPException(
-            status_code=409,
-            detail={
-                "code": "tx_has_inactive_participants",
-                "inactive_participants": inactive,
-            },
-        )
-
-def _attach_related_users(db: Session, tx: Transaction):
-    """
-    Доп.поле на лету: tx.related_users — массив кратких профилей всех задействованных user_id.
-    Это нужно фронту, чтобы всегда показать имя/аватар, даже если пользователь уже не в группе.
-    """
-    user_ids = set()
-    # creator
-    if tx.created_by is not None:
-        user_ids.add(int(tx.created_by))
-    # expense
-    if tx.type == "expense":
-        if tx.paid_by is not None:
-            user_ids.add(int(tx.paid_by))
-        for s in tx.shares or []:
-            if s.user_id is not None:
-                user_ids.add(int(s.user_id))
-    # transfer
-    if tx.type == "transfer":
-        if tx.transfer_from is not None:
-            user_ids.add(int(tx.transfer_from))
-        for uid in (tx.transfer_to or []) or []:
-            user_ids.add(int(uid))
-
-    if not user_ids:
         setattr(tx, "related_users", [])
         return
+    users = db.query(User).filter(User.id.in_(ids)).all()
+    # Для детерминированности — отсортируем по id
+    users_sorted = sorted(users, key=lambda u: u.id or 0)
+    setattr(tx, "related_users", users_sorted)
 
-    users = db.query(User).filter(User.id.in_(user_ids)).all()
-    brief = []
-    for u in users:
-        brief.append({
-            "id": int(u.id),
-            "first_name": getattr(u, "first_name", None),
-            "last_name": getattr(u, "last_name", None),
-            "username": getattr(u, "username", None),
-            "photo_url": getattr(u, "photo_url", None),
-            "name": getattr(u, "name", None),
-        })
-    setattr(tx, "related_users", brief)
+def _inactive_participants(db: Session, group_id: int, tx: Transaction) -> List[User]:
+    """
+    Возвращает список пользователей-участников транзакции, которых НЕТ среди активных членов группы.
+    Используется как запрет на редактирование/удаление исторических транзакций.
+    """
+    active_member_ids = set(get_group_member_ids(db, group_id))
+    involved = _involved_user_ids(tx)
+    missing_ids = [uid for uid in involved if uid not in active_member_ids]
+    if not missing_ids:
+        return []
+    users = db.query(User).filter(User.id.in_(missing_ids)).all()
+    # сортируем по id для стабильности
+    return sorted(users, key=lambda u: u.id or 0)
 
 # ===== Эндпоинты =====
 
@@ -223,9 +163,9 @@ def get_transactions(
         .all()
     )
 
-    # прикрепляем related_users
-    for it in items:
-        _attach_related_users(db, it)
+    # Дополним related_users для каждой транзакции
+    for tx in items:
+        _attach_related_users(db, tx)
 
     if response is not None:
         response.headers["X-Total-Count"] = str(total)
@@ -254,6 +194,7 @@ def get_transaction(
         raise HTTPException(status_code=404, detail="Транзакция не найдена")
 
     require_membership(db, tx.group_id, current_user.id)
+
     _attach_related_users(db, tx)
     return tx
 
@@ -370,13 +311,21 @@ def update_transaction(
     if not tx:
         raise HTTPException(status_code=404, detail="Транзакция не найдена")
 
-    # Любой активный участник группы может редактировать
     require_membership(db, tx.group_id, current_user.id)
     group = guard_mutation_for_member(db, tx.group_id, current_user.id)
     ensure_group_active(group)
 
-    # Блокируем правки, если в транзакции есть «вышедшие из группы»
-    _ensure_no_inactive_or_409(db, tx)
+    # Блокируем редактирование, если в исходной транзакции есть участники,
+    # которые больше не состоят в группе (исторические транзакции).
+    inactive = _inactive_participants(db, tx.group_id, tx)
+    if inactive:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "tx_has_inactive_participants",
+                "inactive_participants": [UserOut.from_orm(u).dict() for u in inactive],
+            },
+        )
 
     # Тип менять нельзя
     if patch.type and patch.type != tx.type:
@@ -493,16 +442,25 @@ def delete_transaction(
     if not tx:
         raise HTTPException(status_code=404, detail="Транзакция не найдена")
 
-    # Любой активный участник может удалить
     group = require_membership(db, tx.group_id, current_user.id)
     ensure_group_active(group)
 
     if tx.is_deleted:
         return Response(status_code=status.HTTP_204_NO_CONTENT)
 
-    # Блокируем удаление, если в транзакции есть «вышедшие из группы»
-    _ensure_no_inactive_or_409(db, tx)
+    # Блокируем удаление, если среди участников транзакции есть те, кто уже не в группе
+    inactive = _inactive_participants(db, tx.group_id, tx)
+    if inactive:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "tx_has_inactive_participants",
+                "inactive_participants": [UserOut.from_orm(u).dict() for u in inactive],
+            },
+        )
 
+    # Права на удаление: разрешаем ЛЮБОМУ участнику активной группы
     tx.is_deleted = True
     db.commit()
     return Response(status_code=status.HTTP_204_NO_CONTENT)
+
