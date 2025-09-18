@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 
-from typing import List, Optional, Dict, Iterable
+from typing import List, Optional, Dict
 from datetime import datetime, date
 from decimal import Decimal
 
@@ -144,7 +144,7 @@ def get_group_settle_up(
     transactions = get_group_transactions(db, group_id)
 
     codes = sorted({(tx.currency_code or "").upper() for tx in transactions if tx.currency_code})
-    currencies = {c.code: int(c.decimals) for c in db.query(Currency).filter(Currency.code.in_(codes)).all()()}
+    currencies = {c.code: int(c.decimals) for c in db.query(Currency).filter(Currency.code.in_(codes)).all()}
     by_ccy = calculate_group_balances_by_currency(transactions, member_ids)
 
     if multicurrency:
@@ -201,6 +201,9 @@ def get_groups_for_user(
     limit: int = Query(20, ge=1, le=200, description="Сколько групп вернуть"),
     offset: int = Query(0, ge=0, description="Смещение для пагинации"),
     q: Optional[str] = Query(None, description="Поиск по названию/описанию"),
+    # новое: сортировка
+    sort_by: Optional[str] = Query(None, description="last_activity|name|created_at|members_count"),
+    sort_dir: Optional[str] = Query(None, description="asc|desc"),
 ):
     if user_id != current_user.id:
         raise HTTPException(status_code=403, detail="Forbidden")
@@ -234,6 +237,7 @@ def get_groups_for_user(
     total = base_q.count()
     response.headers["X-Total-Count"] = str(int(total))
 
+    # Подзапрос last_tx_date
     tx_dates_subq = (
         db.query(
             Transaction.group_id.label("g_id"),
@@ -244,13 +248,42 @@ def get_groups_for_user(
         .subquery()
     )
 
-    page_groups = (
-        base_q.outerjoin(tx_dates_subq, tx_dates_subq.c.g_id == Group.id)
-        .order_by(
-            func.coalesce(tx_dates_subq.c.last_tx_date, cast(None, DateTime)).desc().nullslast(),
+    # Сортировка
+    sb = (sort_by or "").lower().strip()
+    sd = (sort_dir or "").lower().strip()
+    if sd not in ("asc", "desc"):
+        sd = "desc"
+
+    order_clauses = []
+    if sb == "name":
+        order_clauses = [getattr(Group.name, sd)()]
+    elif sb == "created_at":
+        order_clauses = [getattr(Group.id, sd)()]  # surrogate "created_at" по id
+    elif sb == "members_count":
+        # считаем количеством активных membership'ов
+        members_count_subq = (
+            db.query(
+                GroupMember.group_id.label("mgid"),
+                func.count(GroupMember.user_id).label("mcnt"),
+            )
+            .filter(GroupMember.deleted_at.is_(None))
+            .group_by(GroupMember.group_id)
+            .subquery()
+        )
+        base_q = base_q.outerjoin(members_count_subq, members_count_subq.c.mgid == Group.id)
+        order_clauses = [getattr(members_count_subq.c.mcnt, sd)().nullslast(), getattr(Group.id, "desc")()]
+    else:
+        # default: last_activity (как и было)
+        base_q = base_q.outerjoin(tx_dates_subq, tx_dates_subq.c.g_id == Group.id)
+        order_clauses = [
+            getattr(func.coalesce(tx_dates_subq.c.last_tx_date, cast(None, DateTime)), sd)().nullslast(),
             Group.archived_at.desc().nullslast(),
             Group.id.desc(),
-        )
+        ]
+
+    page_groups = (
+        base_q
+        .order_by(*order_clauses)
         .limit(limit)
         .offset(offset)
         .all()
@@ -259,6 +292,14 @@ def get_groups_for_user(
         return []
 
     page_group_ids = {g.id for g in page_groups}
+
+    # Словарь last_activity_at для выдачи (надёжно, без попыток "добавить поле" к ORM-объекту)
+    last_dates = dict(
+        db.query(Transaction.group_id, func.max(Transaction.date))
+        .filter(Transaction.is_deleted == False, Transaction.group_id.in_(page_group_ids))
+        .group_by(Transaction.group_id)
+        .all()
+    )
 
     members = (
         db.query(GroupMember, User)
@@ -288,7 +329,6 @@ def get_groups_for_user(
         preview_members = member_objs_sorted[:members_preview_limit]
         members_count = len({m["user"]["id"] for m in member_objs})
 
-        # ДОБАВЛЕНЫ новые поля в ответе превью
         result.append({
             "id": group.id,
             "name": group.name,
@@ -300,7 +340,7 @@ def get_groups_for_user(
             "archived_at": group.archived_at,
             "deleted_at": group.deleted_at,
             "default_currency_code": group.default_currency_code,
-            "last_activity_at": getattr(group, "last_tx_date", None)  # может быть None
+            "last_activity_at": last_dates.get(group.id),
         })
 
     return result
@@ -622,7 +662,6 @@ def update_group_info(
 # ===== Батч-превью долгов для карточек =====
 
 def _round_amount(value: float, decimals: int) -> float:
-    # безопасное округление float -> нужное количество знаков
     fmt = "{:0." + str(max(0, int(decimals))) + "f}"
     return float(fmt.format(value))
 
@@ -651,14 +690,11 @@ def get_debts_preview(
     except Exception:
         raise HTTPException(status_code=422, detail="Invalid group_ids")
 
-    # подготовим карту округлений по валютам заранее
-    # соберём все валюты из транзакций по группам пачкой
     if not ids:
         return {}
 
     result: Dict[str, Dict[str, Dict[str, float]]] = {}
     for gid in ids:
-        # пропускаем группы, где юзер не участник
         is_member = db.query(GroupMember.id).filter(
             GroupMember.group_id == gid,
             GroupMember.user_id == current_user.id,
