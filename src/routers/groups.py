@@ -195,7 +195,7 @@ def get_groups_for_user(
     response: Response,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_telegram_user),
-    members_preview_limit: int = Query(5, gt=0),  # дефолт 5 (карточка показывает до 5 аватаров)
+    members_preview_limit: int = Query(4, gt=0),
     include_hidden: bool = Query(False, description="Включать персонально скрытые группы"),
     include_archived: bool = Query(False, description="Включать архивные группы"),
     limit: int = Query(20, ge=1, le=200, description="Сколько групп вернуть"),
@@ -223,6 +223,14 @@ def get_groups_for_user(
     )
     if not include_archived:
         base_q = base_q.filter(Group.status == GroupStatus.active)
+
+    # Для клиентской фильтрации "скрытых" отметим их отдельно флагом is_hidden
+    # (даже если include_hidden=False и они не попадут в выборку)
+    hidden_all_for_me = {
+        gid for (gid,) in db.query(GroupHidden.group_id)
+        .filter(GroupHidden.user_id == user_id)
+        .all()
+    }
 
     if not include_hidden:
         base_q = base_q.outerjoin(
@@ -260,7 +268,6 @@ def get_groups_for_user(
     elif sb == "created_at":
         order_clauses = [getattr(Group.id, sd)()]  # surrogate "created_at" по id
     elif sb == "members_count":
-        # считаем количеством активных membership'ов
         members_count_subq = (
             db.query(
                 GroupMember.group_id.label("mgid"),
@@ -273,7 +280,6 @@ def get_groups_for_user(
         base_q = base_q.outerjoin(members_count_subq, members_count_subq.c.mgid == Group.id)
         order_clauses = [getattr(members_count_subq.c.mcnt, sd)().nullslast(), getattr(Group.id, "desc")()]
     else:
-        # default: last_activity (как и было)
         base_q = base_q.outerjoin(tx_dates_subq, tx_dates_subq.c.g_id == Group.id)
         order_clauses = [
             getattr(func.coalesce(tx_dates_subq.c.last_tx_date, cast(None, DateTime)), sd)().nullslast(),
@@ -293,7 +299,7 @@ def get_groups_for_user(
 
     page_group_ids = {g.id for g in page_groups}
 
-    # last_activity_at
+    # Словарь last_activity_at
     last_dates = dict(
         db.query(Transaction.group_id, func.max(Transaction.date))
         .filter(Transaction.is_deleted == False, Transaction.group_id.in_(page_group_ids))
@@ -328,6 +334,7 @@ def get_groups_for_user(
         )
         preview_members = member_objs_sorted[:members_preview_limit]
         members_count = len({m["user"]["id"] for m in member_objs})
+        is_hidden = group.id in hidden_all_for_me  # <— новый флаг
 
         result.append({
             "id": group.id,
@@ -341,6 +348,7 @@ def get_groups_for_user(
             "deleted_at": group.deleted_at,
             "default_currency_code": group.default_currency_code,
             "last_activity_at": last_dates.get(group.id),
+            "is_hidden": is_hidden,  # <— важно для клиентской фильтрации
         })
 
     return result
