@@ -57,6 +57,17 @@ def get_group_or_404(db: Session, group_id: int) -> Group:
     return group
 
 
+def get_group_incl_deleted_or_404(db: Session, group_id: int) -> Group:
+    """
+    Возвращает группу без фильтра по deleted_at.
+    Нужен для просмотра detail архивных/soft-удалённых групп.
+    """
+    group = db.query(Group).filter(Group.id == group_id).first()
+    if not group:
+        raise HTTPException(status_code=404, detail="Группа не найдена")
+    return group
+
+
 def get_group_member_ids(db: Session, group_id: int) -> List[int]:
     # только активные membership'ы
     return [
@@ -99,6 +110,24 @@ def add_member_to_group(db: Session, group_id: int, user_id: int):
     db.add(db_member)
     db.commit()
     db.refresh(db_member)
+
+
+def _has_active_transactions(db: Session, group_id: int) -> bool:
+    return db.query(Transaction.id).filter(
+        Transaction.group_id == group_id,
+        Transaction.is_deleted == False
+    ).first() is not None
+
+
+def _hard_delete_group_impl(db: Session, group_id: int):
+    # удаляем зависимые сущности
+    db.query(GroupHidden).filter(GroupHidden.group_id == group_id).delete(synchronize_session=False)
+    db.query(GroupInvite).filter(GroupInvite.group_id == group_id).delete(synchronize_session=False)
+    db.query(GroupMember).filter(GroupMember.group_id == group_id).delete(synchronize_session=False)
+    # удаляем саму группу
+    db.query(Group).filter(Group.id == group_id).delete(synchronize_session=False)
+    db.commit()
+
 
 # ===== Балансы / Settle-up =====
 
@@ -366,7 +395,8 @@ def group_detail(
     offset: int = Query(0, ge=0),
     limit: Optional[int] = Query(None, gt=0)
 ):
-    group = get_group_or_404(db, group_id)
+    # Разрешаем просматривать даже архивные/soft-удалённые группы
+    group = get_group_incl_deleted_or_404(db, group_id)
     require_membership(db, group_id, current_user.id)
 
     members_query = db.query(GroupMember).options(joinedload(GroupMember.user)).filter(
@@ -503,14 +533,34 @@ def soft_delete_group(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_telegram_user),
 ):
+    """
+    Удаление в один шаг:
+      • если НЕТ транзакций и группа НЕ soft → жестко удаляем сразу;
+      • иначе, если НЕТ долгов → мягкое удаление (deleted_at=now);
+      • иначе → 409.
+    """
     group = require_owner(db, group_id, current_user.id)
-    if group.deleted_at is not None:
+
+    has_tx = _has_active_transactions(db, group_id)
+    has_debts_flag = has_group_debts(db, group_id)
+
+    # Если нет транзакций и НЕ soft → hard сразу
+    if not has_tx and group.deleted_at is None:
+        if has_debts_flag:
+            raise HTTPException(status_code=409, detail="В группе есть непогашенные долги")
+        _hard_delete_group_impl(db, group_id)
         return
-    if has_group_debts(db, group_id):
+
+    # Если есть транзакции — проверяем долги, затем soft
+    if has_debts_flag:
         raise HTTPException(status_code=409, detail="В группе есть непогашенные долги")
 
-    group.deleted_at = datetime.utcnow()
-    db.commit()
+    if group.deleted_at is None:
+        group.deleted_at = datetime.utcnow()
+        db.commit()
+    else:
+        # уже soft — ничего не делаем
+        return
 
 
 @router.post("/{group_id}/restore")
@@ -518,9 +568,12 @@ def restore_group(
     group_id: int,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_telegram_user),
-    to_active: bool = Query(False, description="Попытаться сразу активировать после восстановления"),
+    to_active: bool = Query(False, description="(ignored)"),
     return_full: bool = Query(False, description="Вернуть полную модель GroupOut вместо 204"),
 ):
+    """
+    Восстановление из soft: всегда в ACTIVE (без промежуточной 'archived').
+    """
     group = db.query(Group).filter(Group.id == group_id).first()
     if not group:
         raise HTTPException(status_code=404, detail="Группа не найдена")
@@ -532,19 +585,15 @@ def restore_group(
         return Response(status_code=status.HTTP_204_NO_CONTENT)
 
     group.deleted_at = None
-    if to_active and not has_group_debts(db, group_id):
-        group.status = GroupStatus.active
-        group.archived_at = None
-    else:
-        group.status = GroupStatus.archived
-        group.archived_at = datetime.utcnow()
+    group.status = GroupStatus.active
+    group.archived_at = None
     db.commit()
     if return_full:
         db.refresh(group)
         return GroupOut.from_orm(group)
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
-# ===== Hard-delete (если нет транзакций) =====
+# ===== Hard-delete =====
 
 @router.delete("/{group_id}/hard", status_code=status.HTTP_204_NO_CONTENT)
 def hard_delete_group(
@@ -555,28 +604,23 @@ def hard_delete_group(
     """
     Жёсткое удаление:
       • только владелец,
-      • только если группа уже soft-deleted,
-      • только если в группе нет ТРАНЗАКЦИЙ (активных).
+      • разрешено для активных/архивных/скрытых,
+      • запрещено для soft-deleted (сначала restore),
+      • только если нет активных транзакций и долгов.
     """
     group = require_owner(db, group_id, current_user.id)
-    if group.deleted_at is None:
-        raise HTTPException(status_code=409, detail="Сначала выполните обычное удаление (soft-delete)")
 
-    has_tx = db.query(Transaction.id).filter(
-        Transaction.group_id == group_id,
-        Transaction.is_deleted == False
-    ).first() is not None
-    if has_tx:
+    # Если группа уже soft — запрещаем
+    if group.deleted_at is not None:
+        raise HTTPException(status_code=409, detail="Сначала восстановите группу из удалённых (soft)")
+
+    if _has_active_transactions(db, group_id):
         raise HTTPException(status_code=409, detail="В группе есть транзакции — жёсткое удаление запрещено")
 
-    # удаляем зависимые сущности
-    db.query(GroupHidden).filter(GroupHidden.group_id == group_id).delete(synchronize_session=False)
-    db.query(GroupInvite).filter(GroupInvite.group_id == group_id).delete(synchronize_session=False)
-    db.query(GroupMember).filter(GroupMember.group_id == group_id).delete(synchronize_session=False)
-    # удаляем саму группу
-    db.query(Group).filter(Group.id == group_id).delete(synchronize_session=False)
-    db.commit()
-    return Response(status_code=status.HTTP_204_NO_CONTENT)
+    if has_group_debts(db, group_id):
+        raise HTTPException(status_code=409, detail="В группе есть непогашенные долги")
+
+    _hard_delete_group_impl(db, group_id)
 
 # ===== Смена валюты группы =====
 
@@ -721,7 +765,7 @@ def get_debts_preview(
             continue
 
         codes = sorted({(tx.currency_code or "").upper() for tx in txs if tx.currency_code})
-        decimals_map = {c.code: int(c.decimals) for c in db.query(Currency).filter(Currency.code.in_(codes)).all()}
+        decimals_map = {c.code: int(c.decimals) for c in db.query(Currency).filter(Currency.code.in_(codes)).all() }
         by_ccy = calculate_group_balances_by_currency(txs, members)
 
         owe: Dict[str, float] = {}
