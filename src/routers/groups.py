@@ -30,14 +30,9 @@ from src.schemas.group_member import GroupMemberOut
 from src.schemas.user import UserOut
 from src.utils.telegram_dep import get_current_telegram_user
 from src.utils.groups import (
-    require_membership,
     require_owner,
     ensure_group_active,
     has_group_debts,
-)
-from src.utils.balance import (
-    calculate_group_balances_by_currency,
-    greedy_settle_up_single_currency,
 )
 
 import secrets
@@ -60,7 +55,7 @@ def get_group_or_404(db: Session, group_id: int) -> Group:
 def get_group_incl_deleted_or_404(db: Session, group_id: int) -> Group:
     """
     Возвращает группу без фильтра по deleted_at.
-    Нужен для просмотра detail/балансов архивных/soft-удалённых групп.
+    Нужен для просмотра detail архивных/soft-удалённых групп.
     """
     group = db.query(Group).filter(Group.id == group_id).first()
     if not group:
@@ -129,6 +124,20 @@ def _hard_delete_group_impl(db: Session, group_id: int):
     db.commit()
 
 
+def _require_membership_incl_deleted_group(db: Session, group_id: int, user_id: int) -> None:
+    """
+    Проверяем, что пользователь состоит в группе (активный membership),
+    даже если группа archived/soft-deleted.
+    """
+    is_member = db.query(GroupMember.id).filter(
+        GroupMember.group_id == group_id,
+        GroupMember.user_id == user_id,
+        GroupMember.deleted_at.is_(None)
+    ).first()
+    if not is_member:
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+
 # ===== Балансы / Settle-up =====
 
 @router.get("/{group_id}/balances")
@@ -138,15 +147,9 @@ def get_group_balances(
     current_user: User = Depends(get_current_telegram_user),
     multicurrency: bool = Query(False, description="Вернуть балансы по каждой валюте отдельно"),
 ):
-    # Разрешаем смотреть даже для soft-deleted/archived, но только участникам
-    # (не используем get_group_or_404, чтобы не отваливаться на soft)
-    is_member = db.query(GroupMember.id).filter(
-        GroupMember.group_id == group_id,
-        GroupMember.user_id == current_user.id,
-        GroupMember.deleted_at.is_(None)
-    ).first()
-    if not is_member:
-        raise HTTPException(status_code=403, detail="Forbidden")
+    # Разрешаем для archived и soft-deleted
+    _require_membership_incl_deleted_group(db, group_id, current_user.id)
+    group = get_group_incl_deleted_or_404(db, group_id)
 
     member_ids = get_group_member_ids(db, group_id)
     transactions = get_group_transactions(db, group_id)
@@ -154,6 +157,7 @@ def get_group_balances(
     codes = sorted({(tx.currency_code or "").upper() for tx in transactions if tx.currency_code})
     decimals_map = {c.code: int(c.decimals) for c in db.query(Currency).filter(Currency.code.in_(codes)).all()}
 
+    from src.utils.balance import calculate_group_balances_by_currency
     by_ccy = calculate_group_balances_by_currency(transactions, member_ids)
 
     if multicurrency:
@@ -163,7 +167,6 @@ def get_group_balances(
             result[code] = [{"user_id": uid, "balance": round(float(bal), d)} for uid, bal in balances.items()]
         return result
 
-    group = get_group_incl_deleted_or_404(db, group_id)
     code = (group.default_currency_code or "").upper()
     balances = by_ccy.get(code, {uid: Decimal("0") for uid in member_ids})
     d = decimals_map.get(code, 2)
@@ -177,20 +180,20 @@ def get_group_settle_up(
     current_user: User = Depends(get_current_telegram_user),
     multicurrency: bool = Query(False, description="Вернуть граф выплат по каждой валюте отдельно"),
 ):
-    # Разрешаем смотреть даже для soft-deleted/archived, но только участникам
-    is_member = db.query(GroupMember.id).filter(
-        GroupMember.group_id == group_id,
-        GroupMember.user_id == current_user.id,
-        GroupMember.deleted_at.is_(None)
-    ).first()
-    if not is_member:
-        raise HTTPException(status_code=403, detail="Forbidden")
+    # Разрешаем для archived и soft-deleted
+    _require_membership_incl_deleted_group(db, group_id, current_user.id)
+    group = get_group_incl_deleted_or_404(db, group_id)
 
     member_ids = get_group_member_ids(db, group_id)
     transactions = get_group_transactions(db, group_id)
 
     codes = sorted({(tx.currency_code or "").upper() for tx in transactions if tx.currency_code})
     currencies = {c.code: int(c.decimals) for c in db.query(Currency).filter(Currency.code.in_(codes)).all()}
+
+    from src.utils.balance import (
+        calculate_group_balances_by_currency,
+        greedy_settle_up_single_currency,
+    )
     by_ccy = calculate_group_balances_by_currency(transactions, member_ids)
 
     if multicurrency:
@@ -200,7 +203,6 @@ def get_group_settle_up(
             result[code] = greedy_settle_up_single_currency(balances, d, code)
         return result
 
-    group = get_group_incl_deleted_or_404(db, group_id)
     code = (group.default_currency_code or "").upper()
     balances = by_ccy.get(code, {uid: Decimal("0") for uid in member_ids})
     d = currencies.get(code, 2)
@@ -273,14 +275,13 @@ def get_groups_for_user(
     if not include_archived:
         base_q = base_q.filter(Group.status == GroupStatus.active)
 
-    # отметим скрытые для клиента
+    # скрытые для клиента
     hidden_all_for_me = {
         gid for (gid,) in db.query(GroupHidden.group_id)
         .filter(GroupHidden.user_id == user_id)
         .all()
     }
 
-    # если скрытые не включены — отфильтруем их на уровне запроса
     if not include_hidden:
         base_q = base_q.outerjoin(
             GroupHidden,
@@ -331,9 +332,9 @@ def get_groups_for_user(
     else:
         base_q = base_q.outerjoin(tx_dates_subq, tx_dates_subq.c.g_id == Group.id)
         order_clauses = [
-            getattr(func.coalesce(tx_dates_subq.c.last_tx_date, cast(None, DateTime)), sd)().nullslast(),
-            Group.archived_at.desc().nullslast(),
-            Group.id.desc(),
+          getattr(func.coalesce(tx_dates_subq.c.last_tx_date, cast(None, DateTime)), sd)().nullslast(),
+          Group.archived_at.desc().nullslast(),
+          Group.id.desc(),
         ]
 
     page_groups = (
@@ -373,6 +374,8 @@ def get_groups_for_user(
     result = []
     for group in page_groups:
         gm_list = members_by_group.get(group.id, [])
+        from src.schemas.group_member import GroupMemberOut
+        from src.schemas.user import UserOut
         member_objs = [
             GroupMemberOut.from_orm(gm).dict() | {"user": UserOut.from_orm(user).dict()}
             for gm, user in gm_list
@@ -402,7 +405,7 @@ def get_groups_for_user(
 
     return result
 
-# ===== Детали группы =====
+# ===== Детали группы (просмотр даже soft-deleted/archived) =====
 
 @router.get("/{group_id}/detail/", response_model=GroupOut)
 def group_detail(
@@ -412,17 +415,8 @@ def group_detail(
     offset: int = Query(0, ge=0),
     limit: Optional[int] = Query(None, gt=0)
 ):
-    # Разрешаем просматривать даже архивные/soft-удалённые группы
     group = get_group_incl_deleted_or_404(db, group_id)
-
-    # Проверка членства
-    is_member = db.query(GroupMember.id).filter(
-        GroupMember.group_id == group_id,
-        GroupMember.user_id == current_user.id,
-        GroupMember.deleted_at.is_(None),
-    ).first()
-    if not is_member:
-        raise HTTPException(status_code=403, detail="Forbidden")
+    _require_membership_incl_deleted_group(db, group_id, current_user.id)
 
     members_query = db.query(GroupMember).options(joinedload(GroupMember.user)).filter(
         GroupMember.group_id == group_id,
@@ -441,7 +435,8 @@ def create_group_invite(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_telegram_user)
 ):
-    group = require_membership(db, group_id, current_user.id)
+    group = get_group_or_404(db, group_id)
+    _require_membership_incl_deleted_group(db, group_id, current_user.id)
     ensure_group_active(group)
 
     invite = db.query(GroupInvite).filter(GroupInvite.group_id == group_id).first()
@@ -471,7 +466,7 @@ def accept_group_invite(
     add_member_to_group(db, group.id, current_user.id)
     return {"detail": "Успешно добавлен в группу"}
 
-# ===== Персональное скрытие =====
+# ===== Персональное скрытие (разрешаем и для soft-deleted) =====
 
 @router.post("/{group_id}/hide", status_code=status.HTTP_204_NO_CONTENT)
 def hide_group_for_me(
@@ -479,15 +474,7 @@ def hide_group_for_me(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_telegram_user),
 ):
-    # Разрешаем скрывать даже soft-deleted/archived, если пользователь — участник
-    _ = get_group_incl_deleted_or_404(db, group_id)
-    is_member = db.query(GroupMember.id).filter(
-        GroupMember.group_id == group_id,
-        GroupMember.user_id == current_user.id,
-        GroupMember.deleted_at.is_(None),
-    ).first()
-    if not is_member:
-        raise HTTPException(status_code=403, detail="Forbidden")
+    _require_membership_incl_deleted_group(db, group_id, current_user.id)
 
     exists = db.scalar(
         select(func.count()).select_from(GroupHidden).where(
@@ -508,15 +495,7 @@ def unhide_group_for_me(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_telegram_user),
 ):
-    # Разрешаем показывать обратно даже soft-deleted/archived, если пользователь — участник
-    _ = get_group_incl_deleted_or_404(db, group_id)
-    is_member = db.query(GroupMember.id).filter(
-        GroupMember.group_id == group_id,
-        GroupMember.user_id == current_user.id,
-        GroupMember.deleted_at.is_(None),
-    ).first()
-    if not is_member:
-        raise HTTPException(status_code=403, detail="Forbidden")
+    _require_membership_incl_deleted_group(db, group_id, current_user.id)
 
     row = db.query(GroupHidden).filter(
         GroupHidden.group_id == group_id,
@@ -538,10 +517,6 @@ def archive_group(
     group = require_owner(db, group_id, current_user.id)
     if group.status == GroupStatus.archived:
         return
-    # Нельзя архивировать удалённую (soft) группу
-    if group.deleted_at is not None:
-        raise HTTPException(status_code=409, detail="Удалённую группу нельзя архивировать")
-
     if has_group_debts(db, group_id):
         raise HTTPException(status_code=409, detail="В группе есть непогашенные долги")
 
@@ -579,17 +554,12 @@ def soft_delete_group(
     current_user: User = Depends(get_current_telegram_user),
 ):
     """
-    Удаление:
-      • архивную группу удалять НЕЛЬЗЯ (ни soft, ни hard);
+    Удаление в один шаг:
       • если НЕТ транзакций и группа НЕ soft → жестко удаляем сразу;
       • иначе, если НЕТ долгов → мягкое удаление (deleted_at=now);
       • иначе → 409.
     """
     group = require_owner(db, group_id, current_user.id)
-
-    # Запрет: архивную нельзя удалять
-    if group.status == GroupStatus.archived:
-        raise HTTPException(status_code=409, detail="Архивированную группу нельзя удалять")
 
     has_tx = _has_active_transactions(db, group_id)
     has_debts_flag = has_group_debts(db, group_id)
@@ -654,18 +624,15 @@ def hard_delete_group(
     """
     Жёсткое удаление:
       • только владелец,
+      • разрешено для активных/архивных/скрытых,
       • запрещено для soft-deleted (сначала restore),
-      • запрещено для архивных,
       • только если нет активных транзакций и долгов.
     """
     group = require_owner(db, group_id, current_user.id)
 
+    # Если группа уже soft — запрещаем
     if group.deleted_at is not None:
         raise HTTPException(status_code=409, detail="Сначала восстановите группу из удалённых (soft)")
-
-    # Запрет: архивную нельзя удалять
-    if group.status == GroupStatus.archived:
-        raise HTTPException(status_code=409, detail="Архивированную группу нельзя удалять")
 
     if _has_active_transactions(db, group_id):
         raise HTTPException(status_code=409, detail="В группе есть транзакции — жёсткое удаление запрещено")
@@ -684,8 +651,9 @@ def change_group_currency(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_telegram_user),
 ):
-    require_membership(db, group_id, current_user.id)
+    # Только для активной группы
     group = get_group_or_404(db, group_id)
+    _require_membership_incl_deleted_group(db, group_id, current_user.id)
     ensure_group_active(group)
 
     norm_code = code.upper().strip()
@@ -699,8 +667,8 @@ def change_group_currency(
 # ===== Расписание (end_date / auto_archive) =====
 
 class GroupScheduleUpdate(BaseModel):
-    end_date: Optional[date] = None
-    auto_archive: Optional[bool] = None
+  end_date: Optional[date] = None
+  auto_archive: Optional[bool] = None
 
 @router.patch("/{group_id}/schedule", response_model=GroupOut)
 def update_group_schedule(
@@ -709,8 +677,8 @@ def update_group_schedule(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_telegram_user),
 ):
-    require_membership(db, group_id, current_user.id)
     group = get_group_or_404(db, group_id)
+    _require_membership_incl_deleted_group(db, group_id, current_user.id)
     ensure_group_active(group)
 
     fields_set = getattr(payload, "__fields_set__", getattr(payload, "model_fields_set", set()))
@@ -736,8 +704,8 @@ def update_group_schedule(
     return group
 
 class GroupUpdate(BaseModel):
-    name: Optional[constr(strip_whitespace=True, min_length=1, max_length=120)] = None
-    description: Optional[constr(strip_whitespace=True, max_length=500)] = None
+  name: Optional[constr(strip_whitespace=True, min_length=1, max_length=120)] = None
+  description: Optional[constr(strip_whitespace=True, max_length=500)] = None
 
 @router.patch("/{group_id}", response_model=GroupOut)
 def update_group_info(
@@ -748,10 +716,10 @@ def update_group_info(
 ):
     """
     Частичное обновление названия/описания группы.
-    Доступ: любой участник. Для активной группы.
+    Доступ: любой участник. Только для активной группы.
     """
-    require_membership(db, group_id, current_user.id)
     group = get_group_or_404(db, group_id)
+    _require_membership_incl_deleted_group(db, group_id, current_user.id)
     ensure_group_active(group)
 
     fields_set = getattr(payload, "__fields_set__", getattr(payload, "model_fields_set", set()))
@@ -766,3 +734,61 @@ def update_group_info(
     db.commit()
     db.refresh(group)
     return group
+
+# ===== Батч-превью долгов для карточек =====
+
+def _round_amount(value: float, decimals: int) -> float:
+    fmt = "{:0." + str(max(0, int(decimals))) + "f}"
+    return float(fmt.format(value))
+
+@router.get("/user/{user_id}/debts-preview")
+def get_debts_preview(
+    user_id: int,
+    group_ids: str = Query(..., description="Список ID групп через запятую"),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_telegram_user),
+):
+    if user_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+    try:
+        ids: List[int] = [int(x) for x in group_ids.split(",") if x.strip()]
+    except Exception:
+        raise HTTPException(status_code=422, detail="Invalid group_ids")
+
+    if not ids:
+        return {}
+
+    result: Dict[str, Dict[str, Dict[str, float]]] = {}
+    from src.utils.balance import calculate_group_balances_by_currency
+    for gid in ids:
+        is_member = db.query(GroupMember.id).filter(
+            GroupMember.group_id == gid,
+            GroupMember.user_id == current_user.id,
+            GroupMember.deleted_at.is_(None)
+        ).first()
+        if not is_member:
+            continue
+
+        members = get_group_member_ids(db, gid)
+        txs = get_group_transactions(db, gid)
+        if not txs:
+            result[str(gid)] = {"owe": {}, "owed": {}}
+            continue
+
+        codes = sorted({(tx.currency_code or "").upper() for tx in txs if tx.currency_code})
+        decimals_map = {c.code: int(c.decimals) for c in db.query(Currency).filter(Currency.code.in_(codes)).all() }
+        by_ccy = calculate_group_balances_by_currency(txs, members)
+
+        owe: Dict[str, float] = {}
+        owed: Dict[str, float] = {}
+        for code, balances in by_ccy.items():
+            bal = float(balances.get(current_user.id, Decimal("0")))
+            d = decimals_map.get(code, 2)
+            if bal < 0:
+                owe[code] = _round_amount(abs(bal), d)
+            elif bal > 0:
+                owed[code] = _round_amount(bal, d)
+        result[str(gid)] = {"owe": owe, "owed": owed}
+
+    return result
