@@ -101,6 +101,7 @@ def add_member_to_group(db: Session, group_id: int, user_id: int):
     if exists:
         if exists.deleted_at is not None:
             exists.deleted_at = None
+            exists.updated_at = datetime.utcnow() if hasattr(exists, "updated_at") else None
             db.add(exists)
             db.commit()
             db.refresh(exists)
@@ -150,8 +151,8 @@ def get_group_balances(
     if multicurrency:
         result: Dict[str, List[Dict[str, Decimal]]] = {}
         for code, balances in by_ccy.items():
-            d = decimals_map.get(code, 2)
-            result[code] = [{"user_id": uid, "balance": round(float(bal), d)} for uid, bal in balances.items()]
+          d = decimals_map.get(code, 2)
+          result[code] = [{"user_id": uid, "balance": round(float(bal), d)} for uid, bal in balances.items()]
         return result
 
     group = get_group_or_404(db, group_id)
@@ -179,8 +180,8 @@ def get_group_settle_up(
     if multicurrency:
         result: Dict[str, List[Dict]] = {}
         for code, balances in by_ccy.items():
-            d = currencies.get(code, 2)
-            result[code] = greedy_settle_up_single_currency(balances, d, code)
+          d = currencies.get(code, 2)
+          result[code] = greedy_settle_up_single_currency(balances, d, code)
         return result
 
     group = get_group_or_404(db, group_id)
@@ -780,3 +781,36 @@ def get_debts_preview(
         result[str(gid)] = {"owe": owe, "owed": owed}
 
     return result
+
+# ===== Предпросмотр удаления =====
+
+@router.get("/{group_id}/delete-preview")
+def delete_preview(
+    group_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_telegram_user),
+):
+    """
+    Возвращает режим удаления для фронта:
+      - forbidden: есть долги — удаление запрещено;
+      - soft: есть транзакции, но нет долгов — удаление с возможностью восстановления;
+      - hard: нет ни долгов, ни транзакций — безвозвратное удаление;
+      - disabled: группа уже soft-deleted (кнопку не показываем).
+    """
+    group = get_group_incl_deleted_or_404(db, group_id)
+    if group.owner_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Only owner can perform this action")
+
+    # если уже soft-deleted — на фронте кнопки нет
+    if group.deleted_at is not None:
+        return {"mode": "disabled", "has_debts": False, "has_transactions": False}
+
+    has_tx = _has_active_transactions(db, group_id)
+    has_debts_flag = has_group_debts(db, group_id)
+
+    if has_debts_flag:
+        return {"mode": "forbidden", "has_debts": True, "has_transactions": has_tx}
+    if has_tx:
+        return {"mode": "soft", "has_debts": False, "has_transactions": True}
+    return {"mode": "hard", "has_debts": False, "has_transactions": False}
+
