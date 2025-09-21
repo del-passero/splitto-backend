@@ -2,17 +2,6 @@
 # -----------------------------------------------------------------------------
 # РОУТЕР: Транзакции
 # -----------------------------------------------------------------------------
-# Что поддерживаем:
-#   • Список/деталь, создание, обновление, soft-delete.
-#   • Авторизация через Telegram WebApp.
-#   • Правила доступа: любые мутации — только участникам активной группы.
-#   • Мультивалютность:
-#       – У транзакции фиксируется currency_code (ISO-4217).
-#       – На create: если не прислан, берём default_currency_code группы.
-#       – На update: currency_code меняем ТОЛЬКО если прислали поле.
-#       – Проверка суммы долей выполняется с округлением по Currency.decimals.
-# -----------------------------------------------------------------------------
-
 from __future__ import annotations
 
 from decimal import Decimal, ROUND_HALF_UP
@@ -21,13 +10,15 @@ from typing import List, Optional, Dict, Iterable, Set
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from starlette import status
 from sqlalchemy.orm import Session, selectinload, joinedload
-from sqlalchemy import select
+from sqlalchemy import select, func
 
 from src.db import get_db
 from src.models.transaction import Transaction
 from src.models.transaction_share import TransactionShare
 from src.models.currency import Currency
 from src.models.user import User
+from src.models.group import Group
+from src.models.group_member import GroupMember
 from src.schemas.transaction import TransactionCreate, TransactionUpdate, TransactionOut
 from src.schemas.user import UserOut
 
@@ -46,13 +37,11 @@ router = APIRouter()
 # ===== Вспомогательные =====
 
 def _quant_for_decimals(decimals: int) -> Decimal:
-    """Возвращает квант для Decimal.quantize по числу знаков валюты."""
     if decimals <= 0:
         return Decimal("1")
-    return Decimal("1").scaleb(-decimals)  # 10 ** (-decimals)
+    return Decimal("1").scaleb(-decimals)
 
 def q(x: Decimal, decimals: int) -> Decimal:
-    """Округление банковским правилом до decimals."""
     return x.quantize(_quant_for_decimals(decimals), rounding=ROUND_HALF_UP)
 
 def get_currency_decimals(db: Session, code: str) -> int:
@@ -62,11 +51,6 @@ def get_currency_decimals(db: Session, code: str) -> int:
     return int(cur.decimals or 2)
 
 def _involved_user_ids(tx: Transaction) -> Set[int]:
-    """
-    Возвращает множество участников транзакции (для пометок/проверок):
-      • expense: paid_by + все shares.user_id;
-      • transfer: transfer_from + все из transfer_to.
-    """
     ids: Set[int] = set()
     if tx.type == "expense":
         if tx.paid_by is not None:
@@ -83,46 +67,40 @@ def _involved_user_ids(tx: Transaction) -> Set[int]:
     return ids
 
 def _attach_related_users(db: Session, tx: Transaction) -> None:
-    """
-    Подмешивает к ORM-объекту поле `related_users`: список User по участникам транзакции.
-    Это нужно, чтобы фронтенд мог показать имена/аватары для вышедших из группы пользователей.
-    """
     ids = _involved_user_ids(tx)
     if not ids:
         setattr(tx, "related_users", [])
         return
     users = db.query(User).filter(User.id.in_(ids)).all()
-    # Для детерминированности — отсортируем по id
     users_sorted = sorted(users, key=lambda u: u.id or 0)
     setattr(tx, "related_users", users_sorted)
 
 def _inactive_participants(db: Session, group_id: int, tx: Transaction) -> List[User]:
-    """
-    Возвращает список пользователей-участников транзакции, которых НЕТ среди активных членов группы.
-    Используется как запрет на редактирование/удаление исторических транзакций.
-    """
     active_member_ids = set(get_group_member_ids(db, group_id))
     involved = _involved_user_ids(tx)
     missing_ids = [uid for uid in involved if uid not in active_member_ids]
     if not missing_ids:
         return []
     users = db.query(User).filter(User.id.in_(missing_ids)).all()
-    # сортируем по id для стабильности
     return sorted(users, key=lambda u: u.id or 0)
 
 def _require_membership_incl_deleted_group(db: Session, group_id: int, user_id: int) -> None:
     """
-    Разрешаем ПРОСМОТР сущностей группы (транзакции и т.п.) даже если группа archived или soft-deleted.
-    Требуется активное членство пользователя в группе (membership.deleted_at IS NULL).
+    Разрешаем просмотр транзакций для archived/soft-deleted групп.
+    Требуем: группа существует (включая soft-deleted) и юзер — активный участник (membership не удалён).
     """
-    from src.models.group_member import GroupMember
-    is_member = db.query(GroupMember.id).filter(
-        GroupMember.group_id == group_id,
-        GroupMember.user_id == user_id,
-        GroupMember.deleted_at.is_(None),
-    ).first()
+    group = db.query(Group).filter(Group.id == group_id).first()
+    if not group:
+        raise HTTPException(status_code=404, detail="Группа не найдена")
+    is_member = db.scalar(
+        select(func.count()).select_from(GroupMember).where(
+            GroupMember.group_id == group_id,
+            GroupMember.user_id == user_id,
+            GroupMember.deleted_at.is_(None),
+        )
+    )
     if not is_member:
-        raise HTTPException(status_code=403, detail="Forbidden")
+        raise HTTPException(status_code=403, detail="User is not a group member")
 
 # ===== Эндпоинты =====
 
@@ -147,7 +125,7 @@ def get_transactions(
     )
 
     if group_id is not None:
-        # ВАЖНО: просмотр разрешён и для archived/soft-deleted групп
+        # ВАЖНО: допускаем просмотр даже если группа soft-deleted/archived
         _require_membership_incl_deleted_group(db, group_id, current_user.id)
         qy = qy.filter(Transaction.group_id == group_id)
 
@@ -178,7 +156,6 @@ def get_transactions(
         .all()
     )
 
-    # Дополним related_users для каждой транзакции
     for tx in items:
         _attach_related_users(db, tx)
 
@@ -208,7 +185,7 @@ def get_transaction(
     if not tx:
         raise HTTPException(status_code=404, detail="Транзакция не найдена")
 
-    # Просмотр деталей транзакции разрешён и в archived/soft-deleted группе
+    # Разрешаем просмотр даже если группа soft-deleted/archived
     _require_membership_incl_deleted_group(db, tx.group_id, current_user.id)
 
     _attach_related_users(db, tx)
@@ -224,7 +201,6 @@ def create_transaction(
     group = guard_mutation_for_member(db, tx.group_id, current_user.id)
     ensure_group_active(group)
 
-    # Валюта транзакции: присланная или дефолт группы
     tx_currency = (tx.currency_code or getattr(group, "default_currency_code", None) or "").strip().upper()
     if not tx_currency:
         raise HTTPException(status_code=422, detail="currency_code is required (or group must have default_currency_code)")
@@ -237,7 +213,6 @@ def create_transaction(
 
     member_ids = set(get_group_member_ids(db, tx.group_id))
 
-    # Валидации по типу
     if tx.type == "expense":
         if tx.paid_by is None:
             raise HTTPException(status_code=422, detail="paid_by is required for expense")
@@ -253,7 +228,6 @@ def create_transaction(
         if any(uid not in member_ids for uid in tx.transfer_to):
             raise HTTPException(status_code=400, detail="All transfer_to users must be group members")
 
-    # Агрегация долей и сверка суммы по decimals валюты транзакции
     aggregated_shares: Dict[int, Dict[str, Decimal | int | None]] = {}
     if tx.shares:
         for share in tx.shares:
@@ -274,7 +248,6 @@ def create_transaction(
                 detail=f"Sum of shares ({total_shares}) must equal transaction amount ({total_amount})",
             )
 
-    # Создание транзакции
     tx_dict = tx.model_dump(exclude={"shares"})
     tx_dict["created_by"] = current_user.id
     tx_dict["currency_code"] = tx_currency
@@ -282,7 +255,6 @@ def create_transaction(
     db.add(new_tx)
     db.flush()
 
-    # Доли
     if aggregated_shares:
         shares_objs = []
         for uid, payload in aggregated_shares.items():
@@ -331,8 +303,6 @@ def update_transaction(
     group = guard_mutation_for_member(db, tx.group_id, current_user.id)
     ensure_group_active(group)
 
-    # Блокируем редактирование, если в исходной транзакции есть участники,
-    # которые больше не состоят в группе (исторические транзакции).
     inactive = _inactive_participants(db, tx.group_id, tx)
     if inactive:
         raise HTTPException(
@@ -343,17 +313,14 @@ def update_transaction(
             },
         )
 
-    # Тип менять нельзя
     if patch.type and patch.type != tx.type:
         raise HTTPException(status_code=409, detail="Changing transaction type is not allowed")
 
-    # Определяем валюту и decimals для сверок: либо прислана, либо старая валютa транзакции
     new_currency_code = (patch.currency_code or tx.currency_code or getattr(group, "default_currency_code", None) or "").strip().upper()
     if not new_currency_code:
         raise HTTPException(status_code=422, detail="currency_code is required")
     decimals = get_currency_decimals(db, new_currency_code)
 
-    # Валидация категории
     if patch.category_id is not None:
         allowed_ids = get_allowed_category_ids(db, tx.group_id)
         if not is_category_allowed(allowed_ids, patch.category_id):
@@ -361,7 +328,6 @@ def update_transaction(
 
     member_ids = set(get_group_member_ids(db, tx.group_id))
 
-    # Валидации по типу (PUT подразумевает полную замену — как у вас и было)
     if tx.type == "expense":
         if patch.paid_by is None:
             raise HTTPException(status_code=422, detail="paid_by is required for expense")
@@ -377,7 +343,6 @@ def update_transaction(
         if any(uid not in member_ids for uid in patch.transfer_to):
             raise HTTPException(status_code=400, detail="All transfer_to users must be group members")
 
-    # Доли и сверка суммы с учётом decimals
     aggregated_shares: Dict[int, Dict[str, Decimal | int | None]] = {}
     if patch.shares:
         for share in patch.shares:
@@ -398,9 +363,7 @@ def update_transaction(
                 detail=f"Sum of shares ({total_shares}) must equal transaction amount ({total_amount})",
             )
 
-    # Применяем обновления
     tx.amount = total_amount
-    # Валюту меняем ТОЛЬКО если прислали поле currency_code
     if patch.currency_code:
         tx.currency_code = new_currency_code
     tx.date = patch.date
@@ -464,7 +427,6 @@ def delete_transaction(
     if tx.is_deleted:
         return Response(status_code=status.HTTP_204_NO_CONTENT)
 
-    # Блокируем удаление, если среди участников транзакции есть те, кто уже не в группе
     inactive = _inactive_participants(db, tx.group_id, tx)
     if inactive:
         raise HTTPException(
@@ -475,9 +437,6 @@ def delete_transaction(
             },
         )
 
-    # Права на удаление: разрешаем ЛЮБОМУ участнику активной группы
     tx.is_deleted = True
     db.commit()
     return Response(status_code=status.HTTP_204_NO_CONTENT)
-
-
