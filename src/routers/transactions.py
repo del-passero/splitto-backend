@@ -110,6 +110,20 @@ def _inactive_participants(db: Session, group_id: int, tx: Transaction) -> List[
     # сортируем по id для стабильности
     return sorted(users, key=lambda u: u.id or 0)
 
+def _require_membership_incl_deleted_group(db: Session, group_id: int, user_id: int) -> None:
+    """
+    Разрешаем ПРОСМОТР сущностей группы (транзакции и т.п.) даже если группа archived или soft-deleted.
+    Требуется активное членство пользователя в группе (membership.deleted_at IS NULL).
+    """
+    from src.models.group_member import GroupMember
+    is_member = db.query(GroupMember.id).filter(
+        GroupMember.group_id == group_id,
+        GroupMember.user_id == user_id,
+        GroupMember.deleted_at.is_(None),
+    ).first()
+    if not is_member:
+        raise HTTPException(status_code=403, detail="Forbidden")
+
 # ===== Эндпоинты =====
 
 @router.get("/", response_model=List[TransactionOut])
@@ -133,7 +147,8 @@ def get_transactions(
     )
 
     if group_id is not None:
-        require_membership(db, group_id, current_user.id)
+        # ВАЖНО: просмотр разрешён и для archived/soft-deleted групп
+        _require_membership_incl_deleted_group(db, group_id, current_user.id)
         qy = qy.filter(Transaction.group_id == group_id)
 
     if type:
@@ -193,7 +208,8 @@ def get_transaction(
     if not tx:
         raise HTTPException(status_code=404, detail="Транзакция не найдена")
 
-    require_membership(db, tx.group_id, current_user.id)
+    # Просмотр деталей транзакции разрешён и в archived/soft-deleted группе
+    _require_membership_incl_deleted_group(db, tx.group_id, current_user.id)
 
     _attach_related_users(db, tx)
     return tx
@@ -463,4 +479,5 @@ def delete_transaction(
     tx.is_deleted = True
     db.commit()
     return Response(status_code=status.HTTP_204_NO_CONTENT)
+
 

@@ -561,6 +561,10 @@ def soft_delete_group(
     """
     group = require_owner(db, group_id, current_user.id)
 
+    # Нельзя удалять архивную группу (сначала разархивировать)
+    if group.status == GroupStatus.archived:
+        raise HTTPException(status_code=409, detail="Группа архивирована")
+
     has_tx = _has_active_transactions(db, group_id)
     has_debts_flag = has_group_debts(db, group_id)
 
@@ -629,6 +633,10 @@ def hard_delete_group(
       • только если нет активных транзакций и долгов.
     """
     group = require_owner(db, group_id, current_user.id)
+
+    # Нельзя удалять архивную группу (сначала разархивировать)
+    if group.status == GroupStatus.archived:
+        raise HTTPException(status_code=409, detail="Группа архивирована")
 
     # Если группа уже soft — запрещаем
     if group.deleted_at is not None:
