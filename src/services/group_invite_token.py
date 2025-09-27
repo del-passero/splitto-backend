@@ -1,10 +1,4 @@
 # src/services/group_invite_token.py
-# Генерация и валидация ГРУППОВОГО инвайт-токена формата:
-#   GINV_<groupId>_<inviterUserId>_<base64url(HMAC-SHA256)>
-#
-# ✔ Префикс всегда "GINV_" — фронт легко отличит групповой токен от дружеского
-# ✔ Без срока годности (не протухает). TTL можно добавить позже.
-# ✔ Секрет берём из GROUP_INVITE_SECRET, иначе TELEGRAM_BOT_TOKEN.
 
 from __future__ import annotations
 
@@ -16,49 +10,28 @@ from typing import Tuple
 
 _PREFIX = "GINV"
 
-
 def _secret() -> bytes:
     s = os.environ.get("GROUP_INVITE_SECRET") or os.environ.get("TELEGRAM_BOT_TOKEN")
     if not s:
-        # Без секрета нельзя корректно подписывать и проверять токены
         raise RuntimeError("GROUP_INVITE_SECRET or TELEGRAM_BOT_TOKEN is not set")
     return s.encode("utf-8")
-
 
 def _b64url_encode(b: bytes) -> str:
     return base64.urlsafe_b64encode(b).decode("ascii").rstrip("=")
 
-
 def _b64url_fixpad(s: str) -> str:
-    # добьём паддинг для корректного декода base64url
     rem = len(s) % 4
     return s + ("=" * ((4 - rem) % 4))
 
-
 def create_group_invite_token(group_id: int, inviter_id: int) -> str:
-    """
-    Вернёт строку:
-      GINV_<groupId>_<inviterUserId>_<signature>
-    где signature = base64url(HMAC-SHA256(secret, f"{groupId}:{inviterId}"))
-    """
     if not isinstance(group_id, int) or not isinstance(inviter_id, int):
         raise ValueError("bad_args")
-
     payload = f"{group_id}:{inviter_id}".encode("utf-8")
     mac = hmac.new(_secret(), payload, hashlib.sha256).digest()
     sig = _b64url_encode(mac)
     return f"{_PREFIX}_{group_id}_{inviter_id}_{sig}"
 
-
 def parse_and_validate_token(token: str) -> Tuple[int, int]:
-    """
-    Принимает токен (возможны префиксы 'join:', 'g:', 'token=').
-    Возвращает (group_id, inviter_id) или бросает ValueError с кодом:
-      • bad_token       — пусто/мусор
-      • bad_prefix      — не начинается с GINV_
-      • bad_format      — неверные части
-      • bad_signature   — подпись не сходится
-    """
     if not token:
         raise ValueError("bad_token")
 
@@ -83,7 +56,6 @@ def parse_and_validate_token(token: str) -> Tuple[int, int]:
     except Exception:
         raise ValueError("bad_format")
 
-    # Проверка подписи
     payload = f"{gid}:{uid}".encode("utf-8")
     want = hmac.new(_secret(), payload, hashlib.sha256).digest()
     try:
