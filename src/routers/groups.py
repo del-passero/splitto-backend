@@ -14,7 +14,7 @@ from starlette import status
 from sqlalchemy.orm import Session, joinedload
 from sqlalchemy import func, select, cast
 from sqlalchemy.sql.sqltypes import DateTime
-from pydantic import BaseModel, constr
+from pydantic import BaseModel, constr, AnyHttpUrl
 
 from src.db import get_db
 from src.models.group import Group, GroupStatus
@@ -401,6 +401,8 @@ def get_groups_for_user(
             "default_currency_code": group.default_currency_code,
             "last_activity_at": last_dates.get(group.id),
             "is_hidden": is_hidden,
+            # ---- прокидываем аватар в превью ---------------------------------
+            "avatar_url": group.avatar_url,
         })
 
     return result
@@ -426,10 +428,6 @@ def group_detail(
 
     group.members = members
     return group
-
-
-
-
 
 # ===== Персональное скрытие (разрешаем и для soft-deleted) =====
 
@@ -711,7 +709,7 @@ def update_group_info(
 # ===== Батч-превью долгов для карточек =====
 
 def _round_amount(value: float, decimals: int) -> float:
-    fmt = "{:0." + str(max(0, int(decimals))) + "f}"
+    fmt = "{:0." + str(max(0, int(decimals))) + "f'}"
     return float(fmt.format(value))
 
 @router.get("/user/{user_id}/debts-preview")
@@ -759,9 +757,29 @@ def get_debts_preview(
             bal = float(balances.get(current_user.id, Decimal("0")))
             d = decimals_map.get(code, 2)
             if bal < 0:
-                owe[code] = _round_amount(abs(bal), d)
+                owe[code] = round(abs(bal), d)
             elif bal > 0:
-                owed[code] = _round_amount(bal, d)
+                owed[code] = round(bal, d)
         result[str(gid)] = {"owe": owe, "owed": owed}
 
     return result
+
+# ===== Аватар группы: установка по URL (только владелец) =====================
+
+class AvatarUrlIn(BaseModel):
+    url: AnyHttpUrl
+
+@router.post("/{group_id}/avatar/url", response_model=GroupOut)
+def set_group_avatar_by_url(
+    group_id: int,
+    payload: AvatarUrlIn,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_telegram_user),
+):
+    group = require_owner(db, group_id, current_user.id)
+    group.avatar_url = str(payload.url)
+    group.avatar_file_id = None
+    group.avatar_updated_at = datetime.utcnow()
+    db.commit()
+    db.refresh(group)
+    return group

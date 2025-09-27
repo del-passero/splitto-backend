@@ -39,6 +39,10 @@ class GroupOut(BaseModel):
 
     default_currency_code: str = Field("USD", description="Код валюты ISO-4217 по умолчанию")
 
+    # ---- Аватар группы (URL) -------------------------------------------------
+    avatar_url: Optional[str] = Field(None, description="URL аватара группы")
+    # -------------------------------------------------------------------------
+
     members: List[GroupMemberOut] = Field(default_factory=list, description="Состав группы")
 
     class Config:

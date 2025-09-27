@@ -80,6 +80,24 @@ class Group(Base):
         comment="Дефолтная валюта группы (ISO-4217, напр., 'USD')",
     )
 
+    # ------ АВАТАР ГРУППЫ ----------------------------------------------------
+    avatar_url = Column(
+        String(512),
+        nullable=True,
+        comment="Публичный URL аватара группы",
+    )
+    avatar_file_id = Column(
+        String(256),
+        nullable=True,
+        comment="Telegram file_id источника (опционально, если берём через Bot API)",
+    )
+    avatar_updated_at = Column(
+        DateTime(timezone=True),
+        nullable=True,
+        comment="Когда аватар обновлён (UTC)",
+    )
+    # -------------------------------------------------------------------------
+
     __table_args__ = (
         Index("ix_groups_status", "status"),
         Index("ix_groups_deleted_at", "deleted_at"),
