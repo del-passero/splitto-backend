@@ -9,12 +9,12 @@ from typing import List, Optional, Dict
 from datetime import datetime, date
 from decimal import Decimal
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Response
+from fastapi import APIRouter, Depends, HTTPException, Query, Response, Request
 from starlette import status
 from sqlalchemy.orm import Session, joinedload
 from sqlalchemy import func, select, cast
 from sqlalchemy.sql.sqltypes import DateTime
-from pydantic import BaseModel, constr, AnyHttpUrl
+from pydantic import BaseModel, constr  # AnyHttpUrl НЕ используем для входа, принимаем str
 
 from src.db import get_db
 from src.models.group import Group, GroupStatus
@@ -35,11 +35,12 @@ from src.utils.groups import (
     has_group_debts,
 )
 
+import os
 import secrets
 
 router = APIRouter()
 
-# ===== Вспомогательные =====
+# ===== Вспомогательные =======================================================
 
 def get_group_or_404(db: Session, group_id: int) -> Group:
     group = (
@@ -138,7 +139,48 @@ def _require_membership_incl_deleted_group(db: Session, group_id: int, user_id: 
         raise HTTPException(status_code=403, detail="Forbidden")
 
 
-# ===== Балансы / Settle-up =====
+# --- Нормализация медиа-URL ---------------------------------------------------
+
+def _public_base_url(request: Request) -> str:
+    """
+    База для абсолютных ссылок: сначала PUBLIC_BASE_URL из окружения,
+    иначе — request.base_url (учитывает X-Forwarded-* если настроен прокси).
+    """
+    base = os.getenv("PUBLIC_BASE_URL")
+    if base:
+        return base.rstrip("/")
+    return str(request.base_url).rstrip("/")
+
+def _to_abs_media_url(url: Optional[str], request: Request) -> Optional[str]:
+    """
+    Превращаем относительный путь ("/media/...", "group_avatars/...", "media/...") в абсолютный URL.
+    Абсолютные http(s) возвращаем как есть. Пустые — как есть.
+    """
+    if not url:
+        return url
+    s = str(url).strip()
+    if s.startswith("http://") or s.startswith("https://"):
+        return s
+
+    # Нормализуем путь
+    path = s
+    if not path.startswith("/"):
+        path = "/" + path
+    # если забыли /media — добавим
+    if not path.startswith("/media/"):
+        if path.startswith("/group_avatars/"):
+            path = "/media" + path
+        elif path.startswith("/media"):
+            # например "/media" без завершающего слэша
+            if path != "/media":
+                path = "/media/" + path[len("/media/"):]
+        else:
+            path = "/media" + path
+
+    base = _public_base_url(request)
+    return f"{base}{path}"
+
+# ===== Балансы / Settle-up ====================================================
 
 @router.get("/{group_id}/balances")
 def get_group_balances(
@@ -208,7 +250,7 @@ def get_group_settle_up(
     d = currencies.get(code, 2)
     return greedy_settle_up_single_currency(balances, d, code)
 
-# ===== Создание и базовые списки =====
+# ===== Создание и базовые списки ==============================================
 
 @router.post("/", response_model=GroupOut)
 def create_group(group: GroupCreate, db: Session = Depends(get_db)):
@@ -235,7 +277,7 @@ def get_groups(
         .all()
     )
 
-# ===== Группы пользователя (пагинация + поиск + X-Total-Count) =====
+# ===== Группы пользователя (пагинация + поиск + X-Total-Count) ===============
 
 @router.get("/user/{user_id}")
 def get_groups_for_user(
@@ -243,6 +285,7 @@ def get_groups_for_user(
     response: Response,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_telegram_user),
+    request: Request = None,
     members_preview_limit: int = Query(4, gt=0),
     include_hidden: bool = Query(False, description="Включать персонально скрытые группы"),
     include_archived: bool = Query(False, description="Включать архивные группы"),
@@ -401,19 +444,20 @@ def get_groups_for_user(
             "default_currency_code": group.default_currency_code,
             "last_activity_at": last_dates.get(group.id),
             "is_hidden": is_hidden,
-            # ---- прокидываем аватар в превью ---------------------------------
-            "avatar_url": group.avatar_url,
+            # ---- аватар: отдаём абсолютный URL --------------------------------
+            "avatar_url": _to_abs_media_url(group.avatar_url, request),
         })
 
     return result
 
-# ===== Детали группы (просмотр даже soft-deleted/archived) =====
+# ===== Детали группы (просмотр даже soft-deleted/archived) ====================
 
 @router.get("/{group_id}/detail/", response_model=GroupOut)
 def group_detail(
     group_id: int,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_telegram_user),
+    request: Request = None,
     offset: int = Query(0, ge=0),
     limit: Optional[int] = Query(None, gt=0)
 ):
@@ -426,10 +470,14 @@ def group_detail(
     )
     members = members_query.offset(offset).limit(limit).all() if limit is not None else members_query.all()
 
+    # Нормализуем аватар в абсолютный URL для ответа (БД не трогаем)
+    if getattr(group, "avatar_url", None):
+        group.avatar_url = _to_abs_media_url(group.avatar_url, request)
+
     group.members = members
     return group
 
-# ===== Персональное скрытие (разрешаем и для soft-deleted) =====
+# ===== Персональное скрытие (разрешаем и для soft-deleted) ====================
 
 @router.post("/{group_id}/hide", status_code=status.HTTP_204_NO_CONTENT)
 def hide_group_for_me(
@@ -469,7 +517,7 @@ def unhide_group_for_me(
     db.delete(row)
     db.commit()
 
-# ===== Архивация (глобально) =====
+# ===== Архивация (глобально) ==================================================
 
 @router.post("/{group_id}/archive", status_code=status.HTTP_204_NO_CONTENT)
 def archive_group(
@@ -508,7 +556,7 @@ def unarchive_group(
         return GroupOut.from_orm(group)
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
-# ===== Soft-delete / Restore =====
+# ===== Soft-delete / Restore ===================================================
 
 @router.delete("/{group_id}", status_code=status.HTTP_204_NO_CONTENT)
 def soft_delete_group(
@@ -580,7 +628,7 @@ def restore_group(
         return GroupOut.from_orm(group)
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
-# ===== Hard-delete =====
+# ===== Hard-delete ============================================================
 
 @router.delete("/{group_id}/hard", status_code=status.HTTP_204_NO_CONTENT)
 def hard_delete_group(
@@ -613,7 +661,7 @@ def hard_delete_group(
 
     _hard_delete_group_impl(db, group_id)
 
-# ===== Смена валюты группы =====
+# ===== Смена валюты группы ====================================================
 
 @router.patch("/{group_id}/currency", status_code=status.HTTP_204_NO_CONTENT)
 def change_group_currency(
@@ -635,7 +683,7 @@ def change_group_currency(
     group.default_currency_code = norm_code
     db.commit()
 
-# ===== Расписание (end_date / auto_archive) =====
+# ===== Расписание (end_date / auto_archive) ===================================
 
 class GroupScheduleUpdate(BaseModel):
   end_date: Optional[date] = None
@@ -706,10 +754,10 @@ def update_group_info(
     db.refresh(group)
     return group
 
-# ===== Батч-превью долгов для карточек =====
+# ===== Батч-превью долгов для карточек =======================================
 
 def _round_amount(value: float, decimals: int) -> float:
-    fmt = "{:0." + str(max(0, int(decimals))) + "f'}"
+    fmt = "{:0." + str(max(0, int(decimals))) + "f}"
     return float(fmt.format(value))
 
 @router.get("/user/{user_id}/debts-preview")
@@ -764,10 +812,11 @@ def get_debts_preview(
 
     return result
 
-# ===== Аватар группы: установка по URL (только владелец) =====================
+# ===== Аватар группы: установка по URL (только владелец) ======================
 
 class AvatarUrlIn(BaseModel):
-    url: AnyHttpUrl
+    # принимаем любую непустую строку; относительную превратим в абсолютную
+    url: constr(strip_whitespace=True, min_length=1)
 
 @router.post("/{group_id}/avatar/url", response_model=GroupOut)
 def set_group_avatar_by_url(
@@ -775,11 +824,15 @@ def set_group_avatar_by_url(
     payload: AvatarUrlIn,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_telegram_user),
+    request: Request = None,
 ):
     group = require_owner(db, group_id, current_user.id)
-    group.avatar_url = str(payload.url)
+    absolute_url = _to_abs_media_url(payload.url, request)
+    group.avatar_url = str(absolute_url)
     group.avatar_file_id = None
     group.avatar_updated_at = datetime.utcnow()
     db.commit()
     db.refresh(group)
+    # На всякий случай: отдаём уже нормализованное абсолютное
+    group.avatar_url = _to_abs_media_url(group.avatar_url, request)
     return group
