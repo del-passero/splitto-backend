@@ -1,273 +1,161 @@
 # src/routers/group_invites.py
-import { useEffect, useMemo, useState } from "react"
-import { useNavigate } from "react-router-dom"
-import { acceptGroupInvite, previewGroupInvite, type InvitePreview } from "../api/groupInvitesApi"
+# src/routers/group_invites.py
+from __future__ import annotations
 
-/* i18n */
-type Lang = "ru" | "en" | "es"
-const STRINGS: Record<Lang, Record<string, string>> = {
-  en: {
-    invitedYou: "invited you to the group",
-    close: "Close",
-    join: "Join group",
-    joining: "Joining...",
-    inviteError: "Invite error",
-    acceptFailed: "Failed to accept invite",
-    invalidInvite: "This invite link is invalid or expired.",
-    goHome: "Go to Home",
-  },
-  ru: {
-    invitedYou: "пригласил(а) вас в группу",
-    close: "Закрыть",
-    join: "Вступить в группу",
-    joining: "Вступаем...",
-    inviteError: "Ошибка приглашения",
-    acceptFailed: "Не удалось принять приглашение",
-    invalidInvite: "Ссылка приглашения недействительна или устарела.",
-    goHome: "На главную",
-  },
-  es: {
-    invitedYou: "te invitó al grupo",
-    close: "Cerrar",
-    join: "Unirse al grupo",
-    joining: "Uniéndose...",
-    inviteError: "Error de invitación",
-    acceptFailed: "No se pudo aceptar la invitación",
-    invalidInvite: "Este enlace de invitación no es válido o expiró.",
-    goHome: "Ir al inicio",
-  },
-}
-const normalizeLang = (c?: string | null): Lang => {
-  const x = (c || "").toLowerCase().split("-")[0]
-  return (["ru", "en", "es"].includes(x) ? x : "en") as Lang
-}
-const getLang = (): Lang => {
-  const tg: any = (window as any)?.Telegram?.WebApp
-  return normalizeLang(tg?.initDataUnsafe?.user?.language_code || tg?.initDataUnsafe?.language || tg?.languageCode)
-}
-const useT = () => {
-  const lang = getLang()
-  return (k: keyof typeof STRINGS["en"]) => STRINGS[lang][k] || STRINGS.en[k]
-}
+import os
+import re
+from typing import Optional, List, Tuple
+from urllib.parse import parse_qsl, unquote, quote
 
-/* token helpers */
-function getStartParam(): string | null {
-  const tg: any = (window as any)?.Telegram?.WebApp
-  const fromTg =
-    (tg?.initDataUnsafe?.start_param as string | undefined) ??
-    (tg?.initDataUnsafe?.startParam as string | undefined) ??
-    null
-  const params = new URLSearchParams(window.location.search)
-  const fromUrl = params.get("startapp") || params.get("start") || params.get("tgWebAppStartParam") || null
-  return fromTg || fromUrl
-}
-function normalizeToken(raw?: string | null): string | null {
-  if (!raw) return null
-  let t = String(raw).trim()
-  try { t = decodeURIComponent(t) } catch {}
-  const lower = t.toLowerCase()
-  if (lower.startsWith("join:")) t = t.slice(5)
-  if (lower.startsWith("g:")) t = t.slice(2)
-  if (/^token=/.test(t)) t = t.replace(/^token=/, "")
-  return t || null
-}
+from fastapi import APIRouter, Depends, HTTPException, Body, Path, Request
+from sqlalchemy.orm import Session
 
-/* theming */
-function useOverlayColor() {
-  const tg = (window as any)?.Telegram?.WebApp
-  const scheme = tg?.colorScheme as "light" | "dark" | undefined
-  return scheme === "dark" ? "rgba(0,0,0,0.6)" : "rgba(0,0,0,0.45)"
-}
+from src.db import get_db
+from src.models.user import User
+from src.models.group import Group
+from src.utils.telegram_dep import validate_and_sync_user
 
-/* state */
-type State =
-  | { status: "idle" }
-  | { status: "loading" }
-  | { status: "hidden" }
-  | { status: "ready"; preview: InvitePreview; token?: string | null }
-  | { status: "joining"; preview: InvitePreview; token?: string | null }
-  | { status: "invalid"; reason?: string } // показываем причину
-  | { status: "error"; message: string }
+from src.services.group_invite_token import (
+    create_group_invite_token,
+    parse_and_validate_token,
+)
+from src.services.group_membership import is_member, ensure_member
 
-export default function InviteJoinModal() {
-  const t = useT()
-  const navigate = useNavigate()
-  const [state, setState] = useState<State>({ status: "idle" })
-  const overlayColor = useOverlayColor()
+router = APIRouter(tags=["Инвайты групп"])
 
-  useEffect(() => {
-    let cancelled = false
-    ;(async () => {
-      setState({ status: "loading" })
-      const token = normalizeToken(getStartParam())
+BOT_USERNAME = (os.environ.get("TELEGRAM_BOT_USERNAME") or "").strip()
 
-      if (!token) {
-        setState({ status: "invalid", reason: "missing_token" })
-        return
-      }
 
-      try {
-        const preview = await previewGroupInvite(token)
-        if (cancelled) return
+# ---------------- helpers ----------------
 
-        if (!preview?.group?.id) {
-          setState({ status: "invalid", reason: "group_not_found" })
-          return
-        }
-        if (preview.already_member) {
-          navigate(`/groups/${preview.group.id}`, { replace: true })
-          setState({ status: "hidden" })
-          return
-        }
-        setState({ status: "ready", preview, token })
-      } catch (e: any) {
-        // e.message содержит detail.code из бэка: bad_prefix, bad_signature, bad_token, ...
-        setState({ status: "invalid", reason: e?.message || "bad_token" })
-        console.warn("invite preview failed:", e?.message)
-      }
-    })()
-    return () => { cancelled = true }
-  }, [navigate])
-
-  if (state.status === "hidden" || state.status === "idle" || state.status === "loading") return null
-
-  if (state.status === "invalid") {
-    const cardStyle: React.CSSProperties = {
-      background: "var(--tg-theme-bg-color,#fff)",
-      color: "var(--tg-theme-text-color,#111)",
-      border: "1px solid var(--tg-theme-secondary-bg-color,rgba(0,0,0,0.06))",
-      boxShadow: "0 8px 28px rgba(0,0,0,0.12)",
-    }
-    const hintStyle: React.CSSProperties = {
-      color: "var(--tg-theme-hint-color,rgba(0,0,0,0.6))",
-    }
-    const secondaryBtnStyle: React.CSSProperties = {
-      background: "var(--tg-theme-secondary-bg-color,rgba(0,0,0,0.05))",
-      color: "var(--tg-theme-text-color,#111)",
-    }
-    const debug = state.reason ? `\n\n(code: ${state.reason})` : ""
+def _get_init_data(request: Request) -> Optional[str]:
+    """Пробуем достать initData из заголовков или query (?init_data=...)."""
     return (
-      <div role="dialog" aria-modal="true" className="fixed inset-0 z-[9999] flex items-center justify-center" style={{ background: overlayColor }}>
-        <div className="w-[92%] max-w-[460px] rounded-2xl p-5" style={cardStyle}>
-          <div className="text-base mb-2" style={{ fontWeight: 600 }}>Invite</div>
-          <div className="text-sm whitespace-pre-line" style={hintStyle}>
-            {t("invalidInvite")}{debug}
-          </div>
-          <div className="flex gap-8 justify-end mt-6">
-            <button
-              onClick={() => navigate("/", { replace: true })}
-              className="px-4 py-2 rounded-xl"
-              style={secondaryBtnStyle}
-            >
-              {t("goHome")}
-            </button>
-          </div>
-        </div>
-      </div>
+        request.headers.get("x-telegram-initdata")
+        or request.headers.get("X-Telegram-InitData")
+        or request.query_params.get("init_data")
     )
-  }
 
-  if (state.status === "error") return null
 
-  const { preview, token } =
-    state.status === "ready" || state.status === "joining" ? state : ({ preview: null, token: null } as any)
-  const inviter = preview?.inviter
-  const group = preview?.group
-  const joining = state.status === "joining"
+def _extract_start_param_from_initdata(init_data: str) -> Optional[str]:
+    """
+    initData — подписанная query-строка от Telegram.
+    Внутри неё ищем параметры: start_param/start/startapp/tgWebAppStartParam.
+    """
+    try:
+        pairs = parse_qsl(init_data, keep_blank_values=True)
+    except Exception:
+        return None
+    for k, v in pairs:
+        if k in ("start_param", "start", "startapp", "tgWebAppStartParam"):
+            v = unquote(v or "").strip()
+            return v or None
+    return None
 
-  const inviterTitle = useMemo(() => {
-    const name = inviter?.name || ""
-    const username = inviter?.username ? ` @${inviter.username}` : ""
-    return `${name}${username}`.trim()
-  }, [inviter])
 
-  const onClose = () => {
-    setState({ status: "hidden" })
-    navigate("/", { replace: true })
-  }
+def _normalize_token(raw: Optional[str]) -> Optional[str]:
+    """Убираем префиксы join:, g:, а также token=..."""
+    if not raw:
+        return None
+    t = raw.strip()
+    lo = t.lower()
+    if lo.startswith("join:"):
+        t = t[5:]
+    elif lo.startswith("g:"):
+        t = t[2:]
+    if t.startswith("token="):
+        t = t[6:]
+    return t or None
 
-  const onJoin = async () => {
-    if (!group?.id) return onClose()
-    try {
-      setState({ status: "joining", preview, token })
-      const res = await acceptGroupInvite(token ?? undefined)
-      if (res?.success && res?.group_id) {
-        navigate(`/groups/${res.group_id}`, { replace: true })
-        setState({ status: "hidden" })
-      } else {
-        setState({ status: "error", message: t("acceptFailed") })
-        ;(window as any)?.Telegram?.WebApp?.showPopup?.({
-          title: t("inviteError"),
-          message: t("acceptFailed"),
-          buttons: [{ type: "close" }],
-        })
-        navigate("/", { replace: true })
-      }
-    } catch {
-      setState({ status: "error", message: t("acceptFailed") })
-      ;(window as any)?.Telegram?.WebApp?.showPopup?.({
-        title: t("inviteError"),
-        message: t("acceptFailed"),
-        buttons: [{ type: "close" }],
-      })
-      navigate("/", { replace: true })
-    }
-  }
 
-  const cardStyle: React.CSSProperties = {
-    background: "var(--tg-theme-bg-color,#fff)",
-    color: "var(--tg-theme-text-color,#111)",
-    border: "1px solid var(--tg-theme-secondary-bg-color,rgba(0,0,0,0.06))",
-    boxShadow: "0 8px 28px rgba(0,0,0,0.12)",
-  }
-  const hintStyle: React.CSSProperties = {
-    color: "var(--tg-theme-hint-color,rgba(0,0,0,0.6))",
-  }
-  const secondaryBtnStyle: React.CSSProperties = {
-    background: "var(--tg-theme-secondary-bg-color,rgba(0,0,0,0.05))",
-    color: "var(--tg-theme-text-color,#111)",
-  }
-  const primaryBtnStyle: React.CSSProperties = {
-    background: "var(--tg-theme-button-color,#2ea6ff)",
-    color: "var(--tg-theme-button-text-color,#fff)",
-  }
+def _normalize_candidates(raw: str) -> List[str]:
+    """
+    Готовим варианты для парсера:
+      • исходный
+      • без join:/g:
+      • base64url с добитым паддингом (если нужно)
+    """
+    t = (raw or "").strip()
+    if not t:
+        return []
+    cands = [t]
+    for pref in ("join:", "JOIN:", "g:", "G:"):
+        if t.startswith(pref):
+            cands.append(t[len(pref):])
+    if re.fullmatch(r"[A-Za-z0-9_-]+", t) and (len(t) % 4) != 0:
+        cands.append(t + "=" * ((4 - (len(t) % 4)) % 4))
+    seen, out = set(), []
+    for c in cands:
+        if c not in seen:
+            out.append(c)
+            seen.add(c)
+    return out
 
-  return (
-    <div role="dialog" aria-modal="true" className="fixed inset-0 z-[9999] flex items-center justify-center" style={{ background: overlayColor }}>
-      <div className="w-[92%] max-w-[460px] rounded-2xl p-5" style={cardStyle}>
-        {/* Inviter */}
-        <div className="flex items-center gap-3 mb-3">
-          {inviter?.photo_url ? (
-            <img src={inviter.photo_url} alt="" className="w-12 h-12 rounded-full object-cover" loading="lazy" referrerPolicy="no-referrer" />
-          ) : (
-            <div className="w-12 h-12 rounded-full" style={{ background: "rgba(0,0,0,0.08)" }} />
-          )}
-          <div className="text-sm" style={hintStyle}>{t("invitedYou")}</div>
-        </div>
 
-        {/* Group */}
-        <div className="flex items-center gap-3 mb-4">
-          {group?.avatar_url ? (
-            <img src={group.avatar_url} alt="" className="w-10 h-10 rounded-xl object-cover" loading="lazy" referrerPolicy="no-referrer" />
-          ) : (
-            <div className="w-10 h-10 rounded-xl" style={{ background: "rgba(0,0,0,0.06)" }} />
-          )}
-          <div className="flex flex-col">
-            <div className="font-medium">{group?.name || `#${group?.id}`}</div>
-            {inviterTitle && <div className="text-sm" style={hintStyle}>{inviterTitle}</div>}
-          </div>
-        </div>
+def _extract_token_fallbacks(
+    request: Request,
+    init_data: Optional[str],
+    body_token: Optional[str],
+) -> Tuple[Optional[str], List[str]]:
+    """
+    Возвращает (canonical_token, candidates) в порядке приоритета:
+      1) token из body,
+      2) start_param из initData,
+      3) query (?startapp|?tgWebAppStartParam|?start).
+    """
+    # 1) body
+    if body_token:
+        tok = _normalize_token(body_token)
+        return tok, _normalize_candidates(tok or "")
 
-        {/* Actions */}
-        <div className="flex gap-8 justify-end mt-6">
-          <button onClick={onClose} className="px-4 py-2 rounded-xl" style={secondaryBtnStyle} disabled={joining}>
-            {t("close")}
-          </button>
-          <button onClick={onJoin} className="px-4 py-2 rounded-xl font-medium" style={primaryBtnStyle} disabled={joining}>
-            {joining ? t("joining") : t("join")}
-          </button>
-        </div>
-      </div>
-    </div>
-  )
-}
+    # 2) initData.start_param
+    if init_data:
+        sp = _extract_start_param_from_initdata(init_data)
+        sp = _normalize_token(sp)
+        if sp:
+            return sp, _normalize_candidates(sp)
+
+    # 3) query fallback (кейс: открытие по веб-ссылке вне Telegram)
+    for key in ("startapp", "tgWebAppStartParam", "start"):
+        qv = request.query_params.get(key)
+        qv = _normalize_token(qv)
+        if qv:
+            return qv, _normalize_candidates(qv)
+
+    return None, []
+
+
+def _build_deep_link(token: str) -> Optional[str]:
+    """Готовая ссылка для шаринга: t.me/<bot>?startapp=<token> (если задан TELEGRAM_BOT_USERNAME)."""
+    if not BOT_USERNAME:
+        return None
+    return f"https://t.me/{BOT_USERNAME}?startapp={quote(token)}"
+
+
+# ---------------- endpoints ----------------
+
+@router.post("/groups/{group_id}/invite", response_model=dict)
+def create_group_invite(
+    group_id: int = Path(..., ge=1),
+    db: Session = Depends(get_db),
+    request: Request = None,
+):
+    """
+    Создать бессрочный инвайт-токен на вступление в группу.
+    Требование: текущий пользователь — участник группы.
+    Возвращает { token, deep_link }.
+    """
+    init_data = _get_init_data(request)
+    if not init_data:
+        raise HTTPException(status_code=401, detail="initData required")
+
+    current_user: User = validate_and_sync_user(init_data, db, create_if_missing=False)
+
+    group = db.query(Group).filter(Group.id == group_id).first()
+    if not group:
+        raise HTTPException(status_code=404, detail={"code": "group_not_found"})
+
+    # Проверяем членство (без учёта soft-delete; при желании можно доработать на 'deleted_at is NULL')
+    if not is_member(db, group_id, current_user.id):
+        raise HTTPException(status_code=403, detail=_
+
