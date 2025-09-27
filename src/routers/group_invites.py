@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import os
 import re
-from typing import Optional, List
+from typing import Optional, List, Tuple
 from urllib.parse import parse_qsl, unquote, quote
 
 from fastapi import APIRouter, Depends, HTTPException, Body, Path, Request
@@ -25,6 +25,8 @@ router = APIRouter(tags=["Инвайты групп"])
 BOT_USERNAME = (os.environ.get("TELEGRAM_BOT_USERNAME") or "").strip()
 
 
+# ---------------- helpers ----------------
+
 def _get_init_data(request: Request) -> Optional[str]:
     return (
         request.headers.get("x-telegram-initdata")
@@ -33,7 +35,7 @@ def _get_init_data(request: Request) -> Optional[str]:
     )
 
 
-def _extract_start_param(init_data: str) -> Optional[str]:
+def _extract_start_param_from_initdata(init_data: str) -> Optional[str]:
     """initData — подписанная query-строка Telegram; ищём start_param/start/startapp/tgWebAppStartParam."""
     try:
         pairs = parse_qsl(init_data, keep_blank_values=True)
@@ -78,11 +80,46 @@ def _normalize_candidates(raw: str) -> List[str]:
     return out
 
 
+def _extract_token_fallbacks(
+    request: Request,
+    init_data: Optional[str],
+    body_token: Optional[str],
+) -> Tuple[Optional[str], List[str]]:
+    """
+    Возвращает (canonical_token, candidates):
+      1) token из body (если есть),
+      2) иначе из initData.start_param,
+      3) иначе из query (?startapp|?tgWebAppStartParam|?start)
+    """
+    # 1) body
+    if body_token:
+        tok = _normalize_token(body_token)
+        return tok, _normalize_candidates(tok or "")
+
+    # 2) initData.start_param
+    if init_data:
+        sp = _extract_start_param_from_initdata(init_data)
+        sp = _normalize_token(sp)
+        if sp:
+            return sp, _normalize_candidates(sp)
+
+    # 3) query fallbacks (на случай, если клиент заходит по web-link)
+    for key in ("startapp", "tgWebAppStartParam", "start"):
+        qv = request.query_params.get(key)
+        qv = _normalize_token(qv)
+        if qv:
+            return qv, _normalize_candidates(qv)
+
+    return None, []
+
+
 def _build_deep_link(token: str) -> Optional[str]:
     if not BOT_USERNAME:
         return None
     return f"https://t.me/{BOT_USERNAME}?startapp={quote(token)}"
 
+
+# ---------------- endpoints ----------------
 
 @router.post("/groups/{group_id}/invite", response_model=dict)
 def create_group_invite(
@@ -120,9 +157,10 @@ async def preview_group_invite(
     db: Session = Depends(get_db),
 ):
     """
-    Данные для модалки: кто пригласил, какая группа, уже ли участник.
-    Токен берётся из тела (если есть) или из initData.start_param.
+    Данные для модалки: кто пригласил, что за группа, уже ли участник.
+    Источники токена: body → initData.start_param → query (?startapp|?tgWebAppStartParam|?start)
     """
+    # initData нужен для auth + (в Telegram) содержит start_param
     init_data = _get_init_data(request)
     if not init_data:
         try:
@@ -130,14 +168,12 @@ async def preview_group_invite(
         except Exception:
             body = {}
         init_data = body.get("initData") or body.get("init_data")
-    if not init_data:
-        raise HTTPException(status_code=401, detail="initData required")
 
+    # validate auth (если нет initData — это веб-ссылка извне TG: user всё равно должен быть уже создан)
     current_user: User = validate_and_sync_user(init_data, db, create_if_missing=True)
 
-    if not token:
-        token = _normalize_token(_extract_start_param(init_data))
-    candidates = _normalize_candidates(token or "")
+    # извлечём токен из всех возможных источников
+    canonical, candidates = _extract_token_fallbacks(request, init_data, token)
     if not candidates:
         raise HTTPException(status_code=400, detail={"code": "bad_token"})
 
@@ -178,6 +214,7 @@ async def preview_group_invite(
             "photo_url": _get(inviter, "photo_url", None),
         },
         "already_member": already,
+        "token_source": ("body" if token else ("initData" if canonical and init_data else "query")),
     }
 
 
@@ -188,8 +225,8 @@ async def accept_group_invite(
     db: Session = Depends(get_db),
 ):
     """
-    Вступить в группу по инвайту (по кнопке "Вступить в группу").
-    Токен берётся из тела (если есть) или из initData.start_param.
+    Вступить в группу по инвайту (нажатие «Вступить в группу»).
+    Источники токена: body → initData.start_param → query (?startapp|?tgWebAppStartParam|?start)
     """
     init_data = _get_init_data(request)
     if not init_data:
@@ -198,14 +235,10 @@ async def accept_group_invite(
         except Exception:
             body = {}
         init_data = body.get("initData") or body.get("init_data")
-    if not init_data:
-        raise HTTPException(status_code=401, detail="initData required")
 
     current_user: User = validate_and_sync_user(init_data, db, create_if_missing=True)
 
-    if not token:
-        token = _normalize_token(_extract_start_param(init_data))
-    candidates = _normalize_candidates(token or "")
+    canonical, candidates = _extract_token_fallbacks(request, init_data, token)
     if not candidates:
         raise HTTPException(status_code=400, detail={"code": "bad_token"})
 
