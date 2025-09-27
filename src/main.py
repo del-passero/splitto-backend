@@ -1,15 +1,18 @@
 # src/main.py
 # Главная точка входа FastAPI для Splitto.
 # Что изменено:
-#  • Подключены новые роутеры: /api/currencies, /api/groups/{id}/categories
+#  • Подключены новые роутеры: /api/currencies, /api/groups/{id}/categories, /api/upload/image
+#  • Добавлен StaticFiles-монтаж /media на выбранный MEDIA_ROOT (с фолбэком для локалки)
 #  • Подготовлен (но выключен) запуск фоновой задачи авто-архива (ENV: AUTO_ARCHIVE_ENABLED=1)
 #  • Остальной текущий функционал сохранён без изменений.
 
 from __future__ import annotations
 
 import os
+from pathlib import Path
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles  # ← добавлено
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -29,7 +32,8 @@ from src.routers.expense_categories import router as expense_categories_router
 # --- Новые роутеры ---
 from src.routers.currencies import router as currencies_router
 from src.routers.group_categories import router as group_categories_router
-from src.routers.group_invites import router as group_invites_router  # ← ДОБАВЛЕНО
+from src.routers.group_invites import router as group_invites_router  # ← добавлено ранее
+from src.routers.upload import router as upload_router                 # ← НОВОЕ
 
 # --- Фоновая задача автоархива (выключена по умолчанию) ---
 from src.jobs.auto_archive import start_auto_archive_loop
@@ -53,23 +57,44 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
-    expose_headers=["X-Total-Count"],  # ← ВАЖНО: чтобы фронт видел total для пагинации
+    expose_headers=["X-Total-Count"],  # ← чтобы фронт видел total для пагинации
 )
 
 # --- Подключение роутеров ---
-app.include_router(auth_router,             prefix="/api/auth",              tags=["Авторизация"])
-app.include_router(users_router,            prefix="/api/users",             tags=["Пользователи"])
-app.include_router(groups_router,           prefix="/api/groups",            tags=["Группы"])
-app.include_router(group_members_router,    prefix="/api/group-members",     tags=["Участники групп"])
-app.include_router(transactions_router,     prefix="/api/transactions",      tags=["Транзакции"])
-app.include_router(friends_router,          prefix="/api/friends",           tags=["Друзья"])
-app.include_router(events_router,           prefix="/api/events",            tags=["События"])
+app.include_router(auth_router,               prefix="/api/auth",              tags=["Авторизация"])
+app.include_router(users_router,              prefix="/api/users",             tags=["Пользователи"])
+app.include_router(groups_router,             prefix="/api/groups",            tags=["Группы"])
+app.include_router(group_members_router,      prefix="/api/group-members",     tags=["Участники групп"])
+app.include_router(transactions_router,       prefix="/api/transactions",      tags=["Транзакции"])
+app.include_router(friends_router,            prefix="/api/friends",           tags=["Друзья"])
+app.include_router(events_router,             prefix="/api/events",            tags=["События"])
 app.include_router(expense_categories_router, prefix="/api/expense-categories", tags=["Категории расходов"])
 
 # Новые роутеры под общим /api
-app.include_router(currencies_router,       prefix="/api",                   tags=["Валюты"])
-app.include_router(group_categories_router, prefix="/api",                   tags=["Категории группы"])
-app.include_router(group_invites_router,    prefix="/api",                   tags=["Инвайты групп"])   # ← ДОБАВЛЕНО
+app.include_router(currencies_router,         prefix="/api",                   tags=["Валюты"])
+app.include_router(group_categories_router,   prefix="/api",                   tags=["Категории группы"])
+app.include_router(group_invites_router,      prefix="/api",                   tags=["Инвайты групп"])
+app.include_router(upload_router,             prefix="/api",                   tags=["Загрузка"])  # ← НОВОЕ
+
+# --- Раздача статики /media с безопасным выбором корня ---  ← НОВОЕ
+def _pick_media_root() -> str:
+    """
+    1) SPLITTO_MEDIA_ROOT (рекомендуется для продакшена: /data/uploads)
+    2) иначе пробуем /data/uploads
+    3) если нет прав/папки — ./var/uploads
+    """
+    primary = os.getenv("SPLITTO_MEDIA_ROOT") or "/data/uploads"
+    try:
+        Path(primary).mkdir(parents=True, exist_ok=True)
+        return primary
+    except Exception:
+        fallback = os.getenv("SPLITTO_MEDIA_FALLBACK") or os.path.abspath("./var/uploads")
+        Path(fallback).mkdir(parents=True, exist_ok=True)
+        return fallback
+
+MEDIA_ROOT = _pick_media_root()
+# Пример: файл <MEDIA_ROOT>/group_avatars/abc.jpg доступен по /media/group_avatars/abc.jpg
+app.mount("/media", StaticFiles(directory=MEDIA_ROOT, html=False), name="media")
 
 @app.get("/")
 def root():
