@@ -1,9 +1,10 @@
 # src/routers/group_invites.py
 from __future__ import annotations
 
+import os
 import re
 from typing import Optional, List
-from urllib.parse import parse_qsl, unquote
+from urllib.parse import parse_qsl, unquote, quote
 
 from fastapi import APIRouter, Depends, HTTPException, Body, Path, Request
 from sqlalchemy.orm import Session
@@ -12,13 +13,16 @@ from src.db import get_db
 from src.models.user import User
 from src.models.group import Group
 from src.utils.telegram_dep import validate_and_sync_user
+
 from src.services.group_invite_token import (
     create_group_invite_token,
     parse_and_validate_token,
 )
-from src.services.group_membership import is_active_member, ensure_member
+from src.services.group_membership import is_member, is_active_member, ensure_member
 
 router = APIRouter(tags=["Инвайты групп"])
+
+BOT_USERNAME = (os.environ.get("TELEGRAM_BOT_USERNAME") or "").strip()
 
 
 def _get_init_data(request: Request) -> Optional[str]:
@@ -29,24 +33,8 @@ def _get_init_data(request: Request) -> Optional[str]:
     )
 
 
-def _normalize_candidates(raw: str) -> List[str]:
-    t = (raw or "").strip()
-    if not t:
-        return []
-    cands = [t]
-    for pref in ("join:", "JOIN:", "g:", "G:"):
-        if t.startswith(pref):
-            cands.append(t[len(pref):])
-    if re.fullmatch(r"[A-Za-z0-9_-]+", t) and (len(t) % 4) != 0:
-        cands.append(t + "=" * ((4 - (len(t) % 4)) % 4))
-    seen, out = set(), []
-    for c in cands:
-        if c not in seen:
-            out.append(c); seen.add(c)
-    return out
-
-
 def _extract_start_param(init_data: str) -> Optional[str]:
+    """initData — подписанная query-строка Telegram; ищём start_param/start/startapp/tgWebAppStartParam."""
     try:
         pairs = parse_qsl(init_data, keep_blank_values=True)
     except Exception:
@@ -72,6 +60,30 @@ def _normalize_token(raw: Optional[str]) -> Optional[str]:
     return t or None
 
 
+def _normalize_candidates(raw: str) -> List[str]:
+    """Как есть, без join:/g:, и вариант с base64url-паддингом."""
+    t = (raw or "").strip()
+    if not t:
+        return []
+    cands = [t]
+    for pref in ("join:", "JOIN:", "g:", "G:"):
+        if t.startswith(pref):
+            cands.append(t[len(pref):])
+    if re.fullmatch(r"[A-Za-z0-9_-]+", t) and (len(t) % 4) != 0:
+        cands.append(t + "=" * ((4 - (len(t) % 4)) % 4))
+    seen, out = set(), []
+    for c in cands:
+        if c not in seen:
+            out.append(c); seen.add(c)
+    return out
+
+
+def _build_deep_link(token: str) -> Optional[str]:
+    if not BOT_USERNAME:
+        return None
+    return f"https://t.me/{BOT_USERNAME}?startapp={quote(token)}"
+
+
 @router.post("/groups/{group_id}/invite", response_model=dict)
 def create_group_invite(
     group_id: int = Path(..., ge=1),
@@ -80,7 +92,8 @@ def create_group_invite(
 ):
     """
     Создать бессрочный инвайт-токен на вступление в группу.
-    Требование: текущий пользователь — АКТИВНЫЙ участник группы.
+    Требование: текущий пользователь — активный участник группы.
+    Возвращает { token, deep_link }.
     """
     init_data = _get_init_data(request)
     if not init_data:
@@ -96,7 +109,8 @@ def create_group_invite(
         raise HTTPException(status_code=403, detail={"code": "not_group_member"})
 
     token = create_group_invite_token(group_id=group_id, inviter_id=current_user.id)
-    return {"token": token}
+    deep_link = _build_deep_link(token)
+    return {"token": token, "deep_link": deep_link}
 
 
 @router.post("/groups/invite/preview", response_model=dict)
@@ -106,10 +120,9 @@ async def preview_group_invite(
     db: Session = Depends(get_db),
 ):
     """
-    Вернёт данные для модалки: кто пригласил и в какую группу.
-    Берёт token из тела; если нет — из initData.start_param.
+    Данные для модалки: кто пригласил, какая группа, уже ли участник.
+    Токен берётся из тела (если есть) или из initData.start_param.
     """
-    # 1) validate initData и (при необходимости) создаём пользователя
     init_data = _get_init_data(request)
     if not init_data:
         try:
@@ -122,14 +135,12 @@ async def preview_group_invite(
 
     current_user: User = validate_and_sync_user(init_data, db, create_if_missing=True)
 
-    # 2) токен
     if not token:
         token = _normalize_token(_extract_start_param(init_data))
     candidates = _normalize_candidates(token or "")
     if not candidates:
         raise HTTPException(status_code=400, detail={"code": "bad_token"})
 
-    # 3) parse token -> group_id, inviter_id
     parsed_group_id: Optional[int] = None
     inviter_id: Optional[int] = None
     for cand in candidates:
@@ -142,7 +153,6 @@ async def preview_group_invite(
     if not parsed_group_id:
         raise HTTPException(status_code=400, detail={"code": "bad_token"})
 
-    # 4) load group & inviter (поля аватаров — если есть)
     group = db.query(Group).filter(Group.id == parsed_group_id).first()
     if not group:
         raise HTTPException(status_code=404, detail={"code": "group_not_found"})
@@ -173,15 +183,14 @@ async def preview_group_invite(
 
 @router.post("/groups/invite/accept", response_model=dict)
 async def accept_group_invite(
-    token: Optional[str] = Body(None, embed=True),  # ← токен опционален
+    token: Optional[str] = Body(None, embed=True),
     request: Request = None,
     db: Session = Depends(get_db),
 ):
     """
-    Вступить в группу по инвайту (по кнопке "Вступить в группу" в модалке).
-    Берёт token из тела; если нет — из initData.start_param.
+    Вступить в группу по инвайту (по кнопке "Вступить в группу").
+    Токен берётся из тела (если есть) или из initData.start_param.
     """
-    # 1) validate initData и (при необходимости) создаём пользователя
     init_data = _get_init_data(request)
     if not init_data:
         try:
@@ -194,18 +203,16 @@ async def accept_group_invite(
 
     current_user: User = validate_and_sync_user(init_data, db, create_if_missing=True)
 
-    # 2) токен
     if not token:
         token = _normalize_token(_extract_start_param(init_data))
     candidates = _normalize_candidates(token or "")
     if not candidates:
         raise HTTPException(status_code=400, detail={"code": "bad_token"})
 
-    # 3) parse
     parsed_group_id: Optional[int] = None
     for cand in candidates:
         try:
-            gid, _inviter = parse_and_validate_token(cand)
+            gid, _ = parse_and_validate_token(cand)
             parsed_group_id = gid
             break
         except ValueError:
@@ -213,16 +220,13 @@ async def accept_group_invite(
     if not parsed_group_id:
         raise HTTPException(status_code=400, detail={"code": "bad_token"})
 
-    # 4) группа
     group = db.query(Group).filter(Group.id == parsed_group_id).first()
     if not group:
         raise HTTPException(status_code=404, detail={"code": "group_not_found"})
 
-    # 5) если уже в группе — ок
-    if is_active_member(db, parsed_group_id, current_user.id):
+    if is_member(db, parsed_group_id, current_user.id):
         return {"success": True, "group_id": parsed_group_id}
 
-    # 6) добавляем/реактивируем
     try:
         ensure_member(db, parsed_group_id, current_user.id)
     except ValueError as e:
