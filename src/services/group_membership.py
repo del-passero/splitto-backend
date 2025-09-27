@@ -24,7 +24,7 @@ def is_active_member(db: Session, group_id: int, user_id: int) -> bool:
     )
 
 
-# Считаем, что member = активный member (важно для всех проверок)
+# Для совместимости: считаем, что «member» = «active member»
 def is_member(db: Session, group_id: int, user_id: int) -> bool:
     return is_active_member(db, group_id, user_id)
 
@@ -45,17 +45,20 @@ def ensure_member(db: Session, group_id: int, user_id: int) -> bool:
         .first()
     )
 
+    # Уже активен
     if row and row.deleted_at is None:
-        return False  # уже активен
+        return False
 
+    # Реактивация soft-deleted
     if row and row.deleted_at is not None:
         row.deleted_at = None
         if hasattr(row, "updated_at"):
             setattr(row, "updated_at", datetime.utcnow())
         db.add(row)
         db.commit()
-        return False  # реактивация
+        return False
 
+    # Новая запись
     gm = GroupMember(group_id=group_id, user_id=user_id)
     now = datetime.utcnow()
     if hasattr(gm, "created_at") and getattr(gm, "created_at", None) is None:
@@ -67,7 +70,8 @@ def ensure_member(db: Session, group_id: int, user_id: int) -> bool:
     try:
         db.commit()
     except IntegrityError:
+        # На случай гонки по UNIQUE (group_id, user_id)
         db.rollback()
-        return False  # гонка по UNIQUE → считаем, что уже добавлен
+        return False
 
     return True
