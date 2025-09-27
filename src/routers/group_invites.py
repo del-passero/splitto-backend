@@ -18,7 +18,7 @@ from src.services.group_invite_token import (
     create_group_invite_token,
     parse_and_validate_token,
 )
-from src.services.group_membership import is_member, ensure_member
+from src.services.group_membership import is_active_member, ensure_member
 
 router = APIRouter(tags=["Инвайты групп"])
 
@@ -48,7 +48,7 @@ def _normalize_candidates(raw: str) -> List[str]:
 
     for pref in ("join:", "JOIN:", "g:", "G:"):
         if t.startswith(pref):
-            candidates.append(t[len(pref) :])
+            candidates.append(t[len(pref):])
 
     # base64url-паддинг — добавляем как дополнительный вариант
     if re.fullmatch(r"[A-Za-z0-9_-]+", t) and (len(t) % 4) != 0:
@@ -73,7 +73,7 @@ def create_group_invite(
 ):
     """
     Создать бессрочный инвайт-токен на вступление в группу.
-    Требование: текущий пользователь — участник группы.
+    Требование: текущий пользователь — АКТИВНЫЙ участник группы.
     """
     # 1) initData обязательно, пользователя НЕ создаём
     init_data = _get_init_data(request)
@@ -83,20 +83,15 @@ def create_group_invite(
             detail="initData required (header 'x-telegram-initdata' or '?init_data=...')",
         )
 
-    try:
-        current_user: User = validate_and_sync_user(
-            init_data, db, create_if_missing=False
-        )
-    except HTTPException as e:
-        raise e
+    current_user: User = validate_and_sync_user(init_data, db, create_if_missing=False)
 
     # 2) Группа должна существовать
     group = db.query(Group).filter(Group.id == group_id).first()
     if not group:
         raise HTTPException(status_code=404, detail={"code": "group_not_found"})
 
-    # 3) И текущий пользователь должен быть её участником
-    if not is_member(db, group_id, current_user.id):
+    # 3) Требуем ИМЕННО активное членство
+    if not is_active_member(db, group_id, current_user.id):
         raise HTTPException(status_code=403, detail={"code": "not_group_member"})
 
     # 4) Генерим токен
@@ -122,7 +117,7 @@ async def accept_group_invite(
     if not candidates:
         raise HTTPException(status_code=400, detail={"code": "bad_token"})
 
-    # 2) Валидно ли что-то из кандидатов?
+    # 2) Валидируем токен
     parsed_group_id: Optional[int] = None
     for cand in candidates:
         try:
@@ -157,12 +152,17 @@ async def accept_group_invite(
 
     # 5) Валидируем + СОЗДАЁМ пользователя при необходимости
     current_user: User = validate_and_sync_user(init_data, db, create_if_missing=True)
+    # На всякий случай, если внутри была вставка:
+    try:
+        db.refresh(current_user)
+    except Exception:
+        pass
 
-    # 6) Уже в группе — ОК
-    if is_member(db, parsed_group_id, current_user.id):
+    # 6) Уже активный участник — ОК
+    if is_active_member(db, parsed_group_id, current_user.id):
         return {"success": True, "group_id": parsed_group_id}
 
-    # 7) Добавляем в группу
+    # 7) Добавляем/реактивируем участника
     try:
         ensure_member(db, parsed_group_id, current_user.id)
     except ValueError as e:
