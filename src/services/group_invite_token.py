@@ -1,55 +1,97 @@
 # src/services/group_invite_token.py
+# Генерация и валидация ГРУППОВОГО инвайт-токена формата:
+#   GINV_<groupId>_<inviterUserId>_<base64url(HMAC-SHA256)>
+#
+# ✔ Префикс всегда "GINV_" — фронт легко отличит групповой токен от дружеского
+# ✔ Без срока годности (не протухает). TTL можно добавить позже.
+# ✔ Секрет берём из GROUP_INVITE_SECRET, иначе TELEGRAM_BOT_TOKEN.
+
 from __future__ import annotations
+
 import os
 import hmac
 import base64
 import hashlib
 from typing import Tuple
 
-# Префикс, по которому фронт отличает тип токена
-TOKEN_PREFIX = "GINV_"
+_PREFIX = "GINV"
 
-def _get_secret() -> bytes:
-    # Можно завести отдельный секрет GROUP_INVITE_SECRET, иначе — fallback на TELEGRAM_BOT_TOKEN
-    secret = os.environ.get("GROUP_INVITE_SECRET") or os.environ.get("TELEGRAM_BOT_TOKEN")
-    if not secret:
-        raise RuntimeError("GROUP_INVITE_SECRET or TELEGRAM_BOT_TOKEN must be set")
-    return secret.encode("utf-8")
 
-def _b64url(data: bytes) -> str:
-    return base64.urlsafe_b64encode(data).decode("ascii").rstrip("=")
+def _secret() -> bytes:
+    s = os.environ.get("GROUP_INVITE_SECRET") or os.environ.get("TELEGRAM_BOT_TOKEN")
+    if not s:
+        # Без секрета нельзя корректно подписывать и проверять токены
+        raise RuntimeError("GROUP_INVITE_SECRET or TELEGRAM_BOT_TOKEN is not set")
+    return s.encode("utf-8")
 
-def _unb64url(s: str) -> bytes:
-    pad = "=" * (-len(s) % 4)
-    return base64.urlsafe_b64decode(s + pad)
+
+def _b64url_encode(b: bytes) -> str:
+    return base64.urlsafe_b64encode(b).decode("ascii").rstrip("=")
+
+
+def _b64url_fixpad(s: str) -> str:
+    # добьём паддинг для корректного декода base64url
+    rem = len(s) % 4
+    return s + ("=" * ((4 - rem) % 4))
+
 
 def create_group_invite_token(group_id: int, inviter_id: int) -> str:
     """
-    Формат: GINV_<gid>_<uid>_<sig>
-    где sig = base64url( HMAC(secret, f"{gid}:{uid}") )
+    Вернёт строку:
+      GINV_<groupId>_<inviterUserId>_<signature>
+    где signature = base64url(HMAC-SHA256(secret, f"{groupId}:{inviterId}"))
     """
-    secret = _get_secret()
-    base = f"{int(group_id)}:{int(inviter_id)}".encode("utf-8")
-    sig = hmac.new(secret, base, hashlib.sha256).digest()
-    token = f"{TOKEN_PREFIX}{group_id}_{inviter_id}_{_b64url(sig)}"
-    return token
+    if not isinstance(group_id, int) or not isinstance(inviter_id, int):
+        raise ValueError("bad_args")
+
+    payload = f"{group_id}:{inviter_id}".encode("utf-8")
+    mac = hmac.new(_secret(), payload, hashlib.sha256).digest()
+    sig = _b64url_encode(mac)
+    return f"{_PREFIX}_{group_id}_{inviter_id}_{sig}"
+
 
 def parse_and_validate_token(token: str) -> Tuple[int, int]:
     """
-    Возвращает (group_id, inviter_id) или бросает ValueError.
+    Принимает токен (возможны префиксы 'join:', 'g:', 'token=').
+    Возвращает (group_id, inviter_id) или бросает ValueError с кодом:
+      • bad_token       — пусто/мусор
+      • bad_prefix      — не начинается с GINV_
+      • bad_format      — неверные части
+      • bad_signature   — подпись не сходится
     """
-    if not token or not token.startswith(TOKEN_PREFIX):
+    if not token:
+        raise ValueError("bad_token")
+
+    t = token.strip()
+    low = t.lower()
+    for pref in ("join:", "g:", "token="):
+        if low.startswith(pref):
+            t = t[len(pref):]
+            low = t.lower()
+
+    if not t.startswith(_PREFIX + "_"):
         raise ValueError("bad_prefix")
+
+    parts = t.split("_", 3)
+    if len(parts) != 4:
+        raise ValueError("bad_format")
+
+    _, gid_str, uid_str, sig = parts
     try:
-        _, gid, uid, sig = token.split("_", 3)
-        gid_i = int(gid)
-        uid_i = int(uid)
-        secret = _get_secret()
-        base = f"{gid_i}:{uid_i}".encode("utf-8")
-        expected = hmac.new(secret, base, hashlib.sha256).digest()
-        got = _unb64url(sig)
-        if not hmac.compare_digest(expected, got):
-            raise ValueError("bad_signature")
-        return gid_i, uid_i
-    except Exception as e:
-        raise ValueError(str(e))
+        gid = int(gid_str)
+        uid = int(uid_str)
+    except Exception:
+        raise ValueError("bad_format")
+
+    # Проверка подписи
+    payload = f"{gid}:{uid}".encode("utf-8")
+    want = hmac.new(_secret(), payload, hashlib.sha256).digest()
+    try:
+        got = base64.urlsafe_b64decode(_b64url_fixpad(sig))
+    except Exception:
+        raise ValueError("bad_signature")
+
+    if not hmac.compare_digest(want, got):
+        raise ValueError("bad_signature")
+
+    return gid, uid
