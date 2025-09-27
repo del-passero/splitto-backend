@@ -11,10 +11,7 @@ from sqlalchemy.orm import Session
 from src.db import get_db
 from src.models.user import User
 from src.models.group import Group
-
-# валидация initData + создание пользователя при необходимости
 from src.utils.telegram_dep import validate_and_sync_user
-
 from src.services.group_invite_token import (
     create_group_invite_token,
     parse_and_validate_token,
@@ -25,7 +22,6 @@ router = APIRouter(tags=["Инвайты групп"])
 
 
 def _get_init_data(request: Request) -> Optional[str]:
-    """Единая точка получения initData: заголовки, query, тело (fallback ниже)."""
     return (
         request.headers.get("x-telegram-initdata")
         or request.headers.get("X-Telegram-InitData")
@@ -34,12 +30,6 @@ def _get_init_data(request: Request) -> Optional[str]:
 
 
 def _normalize_candidates(raw: str) -> List[str]:
-    """
-    Подготавливаем варианты токена:
-    - как есть
-    - без join:/g:
-    - c base64url-паддингом
-    """
     t = (raw or "").strip()
     if not t:
         return []
@@ -49,7 +39,6 @@ def _normalize_candidates(raw: str) -> List[str]:
             cands.append(t[len(pref):])
     if re.fullmatch(r"[A-Za-z0-9_-]+", t) and (len(t) % 4) != 0:
         cands.append(t + "=" * ((4 - (len(t) % 4)) % 4))
-    # uniq
     seen, out = set(), []
     for c in cands:
         if c not in seen:
@@ -58,10 +47,6 @@ def _normalize_candidates(raw: str) -> List[str]:
 
 
 def _extract_start_param(init_data: str) -> Optional[str]:
-    """
-    initData — это подписанная query-строка Telegram.
-    Извлекаем start_param/start/startapp/tgWebAppStartParam.
-    """
     try:
         pairs = parse_qsl(init_data, keep_blank_values=True)
     except Exception:
@@ -97,38 +82,34 @@ def create_group_invite(
     Создать бессрочный инвайт-токен на вступление в группу.
     Требование: текущий пользователь — АКТИВНЫЙ участник группы.
     """
-    # 1) initData обязательно, пользователя НЕ создаём
     init_data = _get_init_data(request)
     if not init_data:
         raise HTTPException(status_code=401, detail="initData required")
 
     current_user: User = validate_and_sync_user(init_data, db, create_if_missing=False)
 
-    # 2) Группа
     group = db.query(Group).filter(Group.id == group_id).first()
     if not group:
         raise HTTPException(status_code=404, detail={"code": "group_not_found"})
 
-    # 3) Только активный участник может генерить инвайт
     if not is_active_member(db, group_id, current_user.id):
         raise HTTPException(status_code=403, detail={"code": "not_group_member"})
 
-    # 4) Токен
     token = create_group_invite_token(group_id=group_id, inviter_id=current_user.id)
     return {"token": token}
 
 
-@router.post("/groups/invite/accept", response_model=dict)
-async def accept_group_invite(
-    token: str = Body(None, embed=True),  # ⬅️ токен теперь НЕ обязателен
+@router.post("/groups/invite/preview", response_model=dict)
+async def preview_group_invite(
+    token: Optional[str] = Body(None, embed=True),
     request: Request = None,
     db: Session = Depends(get_db),
 ):
     """
-    Принять инвайт по токену ИЛИ по start_param из initData (если token не передан).
-    Возвращает { success, group_id }.
+    Вернёт данные для модалки: кто пригласил и в какую группу.
+    Берёт token из тела; если нет — из initData.start_param.
     """
-    # 0) initData (обязательно для валидации подписи WebApp и создания пользователя)
+    # 1) validate initData и (при необходимости) создаём пользователя
     init_data = _get_init_data(request)
     if not init_data:
         try:
@@ -139,19 +120,88 @@ async def accept_group_invite(
     if not init_data:
         raise HTTPException(status_code=401, detail="initData required")
 
-    # 1) Создадим/синхронизируем пользователя (и ВАЛИДИРУЕМ initData)
     current_user: User = validate_and_sync_user(init_data, db, create_if_missing=True)
 
-    # 2) Если token не пришёл в теле — попробуем достать из start_param
+    # 2) токен
     if not token:
         token = _normalize_token(_extract_start_param(init_data))
-
-    # 3) Готовим варианты токена
     candidates = _normalize_candidates(token or "")
     if not candidates:
         raise HTTPException(status_code=400, detail={"code": "bad_token"})
 
-    # 4) Валидируем токен → получаем group_id
+    # 3) parse token -> group_id, inviter_id
+    parsed_group_id: Optional[int] = None
+    inviter_id: Optional[int] = None
+    for cand in candidates:
+        try:
+            gid, inv = parse_and_validate_token(cand)
+            parsed_group_id, inviter_id = gid, inv
+            break
+        except ValueError:
+            continue
+    if not parsed_group_id:
+        raise HTTPException(status_code=400, detail={"code": "bad_token"})
+
+    # 4) load group & inviter (поля аватаров — если есть)
+    group = db.query(Group).filter(Group.id == parsed_group_id).first()
+    if not group:
+        raise HTTPException(status_code=404, detail={"code": "group_not_found"})
+
+    inviter = db.query(User).filter(User.id == inviter_id).first() if inviter_id else None
+
+    def _get(obj, field, default=None):
+        return getattr(obj, field) if hasattr(obj, field) else default
+
+    already = is_active_member(db, parsed_group_id, current_user.id)
+
+    return {
+        "group": {
+            "id": group.id,
+            "name": _get(group, "name", None),
+            "avatar_url": _get(group, "avatar_url", None),
+        },
+        "inviter": inviter
+        and {
+            "id": inviter.id,
+            "name": _get(inviter, "name", None),
+            "username": _get(inviter, "username", None),
+            "photo_url": _get(inviter, "photo_url", None),
+        },
+        "already_member": already,
+    }
+
+
+@router.post("/groups/invite/accept", response_model=dict)
+async def accept_group_invite(
+    token: Optional[str] = Body(None, embed=True),  # ← токен опционален
+    request: Request = None,
+    db: Session = Depends(get_db),
+):
+    """
+    Вступить в группу по инвайту (по кнопке "Вступить в группу" в модалке).
+    Берёт token из тела; если нет — из initData.start_param.
+    """
+    # 1) validate initData и (при необходимости) создаём пользователя
+    init_data = _get_init_data(request)
+    if not init_data:
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        init_data = body.get("initData") or body.get("init_data")
+    if not init_data:
+        raise HTTPException(status_code=401, detail="initData required")
+
+    current_user: User = validate_and_sync_user(init_data, db, create_if_missing=True)
+
+    # 2) токен
+    if not token:
+        token = _normalize_token(_extract_start_param(init_data))
+    candidates = _normalize_candidates(token or "")
+    if not candidates:
+        raise HTTPException(status_code=400, detail={"code": "bad_token"})
+
+    # 3) parse
     parsed_group_id: Optional[int] = None
     for cand in candidates:
         try:
@@ -163,16 +213,16 @@ async def accept_group_invite(
     if not parsed_group_id:
         raise HTTPException(status_code=400, detail={"code": "bad_token"})
 
-    # 5) Группа существует?
+    # 4) группа
     group = db.query(Group).filter(Group.id == parsed_group_id).first()
     if not group:
         raise HTTPException(status_code=404, detail={"code": "group_not_found"})
 
-    # 6) Уже активный участник?
+    # 5) если уже в группе — ок
     if is_active_member(db, parsed_group_id, current_user.id):
         return {"success": True, "group_id": parsed_group_id}
 
-    # 7) Добавляем/реактивируем
+    # 6) добавляем/реактивируем
     try:
         ensure_member(db, parsed_group_id, current_user.id)
     except ValueError as e:
