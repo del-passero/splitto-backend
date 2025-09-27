@@ -427,44 +427,9 @@ def group_detail(
     group.members = members
     return group
 
-# ===== Инвайты =====
-
-@router.post("/{group_id}/invite", response_model=GroupInviteOut)
-def create_group_invite(
-    group_id: int,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_telegram_user)
-):
-    group = get_group_or_404(db, group_id)
-    _require_membership_incl_deleted_group(db, group_id, current_user.id)
-    ensure_group_active(group)
-
-    invite = db.query(GroupInvite).filter(GroupInvite.group_id == group_id).first()
-    if not invite:
-        token = secrets.token_urlsafe(16)
-        invite = GroupInvite(group_id=group_id, token=token)
-        db.add(invite)
-        db.commit()
-        db.refresh(invite)
-    return invite
 
 
-@router.post("/accept-invite")
-def accept_group_invite(
-    token: str,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_telegram_user)
-):
-    invite = db.query(GroupInvite).filter(GroupInvite.token == token).first()
-    if not invite:
-        raise HTTPException(status_code=404, detail="Инвайт не найден")
 
-    group = get_group_or_404(db, invite.group_id)
-    if group.status == GroupStatus.archived:
-        raise HTTPException(status_code=409, detail="Группа архивирована")
-
-    add_member_to_group(db, group.id, current_user.id)
-    return {"detail": "Успешно добавлен в группу"}
 
 # ===== Персональное скрытие (разрешаем и для soft-deleted) =====
 
