@@ -812,7 +812,8 @@ def get_debts_preview(
 
     return result
 
-# ===== Аватар группы: установка по URL (только владелец) ======================
+
+# ===== Аватар группы: установка по URL (любой участник активной группы) ======
 
 class AvatarUrlIn(BaseModel):
     # принимаем любую непустую строку; относительную превратим в абсолютную
@@ -826,13 +827,40 @@ def set_group_avatar_by_url(
     current_user: User = Depends(get_current_telegram_user),
     request: Request = None,
 ):
-    group = require_owner(db, group_id, current_user.id)
+    # было: group = require_owner(db, group_id, current_user.id)
+    group = get_group_or_404(db, group_id)
+    _require_membership_incl_deleted_group(db, group_id, current_user.id)
+    ensure_group_active(group)
+
     absolute_url = _to_abs_media_url(payload.url, request)
     group.avatar_url = str(absolute_url)
     group.avatar_file_id = None
     group.avatar_updated_at = datetime.utcnow()
     db.commit()
     db.refresh(group)
-    # На всякий случай: отдаём уже нормализованное абсолютное
+
+    # Отдаём уже нормализованное абсолютное
     group.avatar_url = _to_abs_media_url(group.avatar_url, request)
     return group
+
+# ===== Аватар группы: удаление (любой участник активной группы) ==============
+
+@router.delete("/{group_id}/avatar", status_code=status.HTTP_204_NO_CONTENT)
+def delete_group_avatar(
+    group_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_telegram_user),
+):
+    # было: group = require_owner(db, group_id, current_user.id)
+    group = get_group_or_404(db, group_id)
+    _require_membership_incl_deleted_group(db, group_id, current_user.id)
+    ensure_group_active(group)
+
+    group.avatar_url = None
+    group.avatar_file_id = None
+    group.avatar_updated_at = datetime.utcnow()
+    db.commit()
+
+
+
+
