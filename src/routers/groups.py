@@ -117,71 +117,6 @@ def _has_active_transactions(db: Session, group_id: int) -> bool:
     ).first() is not None
 
 
-def _hard_delete_group_impl(db: Session, group_id: int):
-    # удаляем зависимые сущности
-    db.query(GroupHidden).filter(GroupHidden.group_id == group_id).delete(synchronize_session=False)
-    db.query(GroupInvite).filter(GroupInvite.group_id == group_id).delete(synchronize_session=False)
-    db.query(GroupMember).filter(GroupMember.group_id == group_id).delete(synchronize_session=False)
-    # удаляем саму группу
-    db.query(Group).filter(Group.id == group_id).delete(synchronize_session=False)
-    db.commit()
-
-
-def _require_membership_incl_deleted_group(db: Session, group_id: int, user_id: int) -> None:
-    """
-    Проверяем, что пользователь состоит в группе (активный membership),
-    даже если группа archived/soft-deleted.
-    """
-    is_member = db.query(GroupMember.id).filter(
-        GroupMember.group_id == group_id,
-        GroupMember.user_id == user_id,
-        GroupMember.deleted_at.is_(None)
-    ).first()
-    if not is_member:
-        raise HTTPException(status_code=403, detail="Forbidden")
-
-
-# --- Нормализация медиа-URL ---------------------------------------------------
-
-def _public_base_url(request: Request) -> str:
-    """
-    База для абсолютных ссылок: сначала PUBLIC_BASE_URL из окружения,
-    иначе — request.base_url (учитывает X-Forwarded-* если настроен прокси).
-    """
-    base = os.getenv("PUBLIC_BASE_URL")
-    if base:
-        return base.rstrip("/")
-    return str(request.base_url).rstrip("/")
-
-def _to_abs_media_url(url: Optional[str], request: Request) -> Optional[str]:
-    """
-    Превращаем относительный путь ("/media/...", "group_avatars/...", "media/...") в абсолютный URL.
-    Абсолютные http(s) возвращаем как есть. Пустые — как есть.
-    """
-    if not url:
-        return url
-    s = str(url).strip()
-    if s.startswith("http://") or s.startswith("https://"):
-        return s
-
-    # Нормализуем путь
-    path = s
-    if not path.startswith("/"):
-        path = "/" + path
-    # если забыли /media — добавим
-    if not path.startswith("/media/"):
-        if path.startswith("/group_avatars/"):
-            path = "/media" + path
-        elif path.startswith("/media"):
-            # например "/media" без завершающего слэша
-            if path != "/media":
-                path = "/media/" + path[len("/media/"):]
-        else:
-            path = "/media" + path
-
-    base = _public_base_url(request)
-    return f"{base}{path}"
-
 # --- Локальное хранилище (удаление старых аватаров) ---------------------------
 
 def _pick_media_root() -> Path:
@@ -259,6 +194,83 @@ def _delete_avatar_file_if_local(url: Optional[str]) -> bool:
         return False
     except Exception:
         return False
+
+
+def _hard_delete_group_impl(db: Session, group_id: int):
+    """
+    Жёсткое удаление зависимостей + самой группы. После успешного commit
+    пробуем удалить локальный файл аватара (если был и если локальный).
+    """
+    # Сохраним текущий аватар до удаления записи
+    group_row: Optional[Group] = db.query(Group).filter(Group.id == group_id).first()
+    avatar_url_before = getattr(group_row, "avatar_url", None) if group_row else None
+
+    # удаляем зависимые сущности
+    db.query(GroupHidden).filter(GroupHidden.group_id == group_id).delete(synchronize_session=False)
+    db.query(GroupInvite).filter(GroupInvite.group_id == group_id).delete(synchronize_session=False)
+    db.query(GroupMember).filter(GroupMember.group_id == group_id).delete(synchronize_session=False)
+    # удаляем саму группу
+    db.query(Group).filter(Group.id == group_id).delete(synchronize_session=False)
+    db.commit()
+
+    # после успешного commit — пытаемся удалить локальный файл
+    _delete_avatar_file_if_local(avatar_url_before)
+
+
+def _require_membership_incl_deleted_group(db: Session, group_id: int, user_id: int) -> None:
+    """
+    Проверяем, что пользователь состоит в группе (активный membership),
+    даже если группа archived/soft-deleted.
+    """
+    is_member = db.query(GroupMember.id).filter(
+        GroupMember.group_id == group_id,
+        GroupMember.user_id == user_id,
+        GroupMember.deleted_at.is_(None)
+    ).first()
+    if not is_member:
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+
+# --- Нормализация медиа-URL ---------------------------------------------------
+
+def _public_base_url(request: Request) -> str:
+    """
+    База для абсолютных ссылок: сначала PUBLIC_BASE_URL из окружения,
+    иначе — request.base_url (учитывает X-Forwarded-* если настроен прокси).
+    """
+    base = os.getenv("PUBLIC_BASE_URL")
+    if base:
+        return base.rstrip("/")
+    return str(request.base_url).rstrip("/")
+
+def _to_abs_media_url(url: Optional[str], request: Request) -> Optional[str]:
+    """
+    Превращаем относительный путь ("/media/...", "group_avatars/...", "media/...") в абсолютный URL.
+    Абсолютные http(s) возвращаем как есть. Пустые — как есть.
+    """
+    if not url:
+        return url
+    s = str(url).strip()
+    if s.startswith("http://") or s.startswith("https://"):
+        return s
+
+    # Нормализуем путь
+    path = s
+    if not path.startswith("/"):
+        path = "/" + path
+    # если забыли /media — добавим
+    if not path.startswith("/media/"):
+        if path.startswith("/group_avatars/"):
+            path = "/media" + path
+        elif path.startswith("/media"):
+            # например "/media" без завершающего слэша
+            if path != "/media":
+                path = "/media/" + path[len("/media/"):]
+        else:
+            path = "/media" + path
+
+    base = _public_base_url(request)
+    return f"{base}{path}"
 
 # ===== Балансы / Settle-up ====================================================
 
