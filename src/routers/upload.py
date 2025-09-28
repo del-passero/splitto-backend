@@ -60,8 +60,11 @@ async def upload_image(file: UploadFile = File(...), request: Request = None):
     if not any(ctype.startswith(p) for p in ALLOWED_PREFIXES):
         raise HTTPException(status_code=415, detail="Only image/* allowed")
 
-    # Генерация имени, определяем расширение
-    ext = mimetypes.guess_extension(ctype) or ".bin"
+    # Генерация имени, определяем расширение (сFallbackом по исходному имени)
+    guessed_ext = mimetypes.guess_extension(ctype) or ""
+    name_ext = (os.path.splitext(file.filename or "")[1].lower() or "")
+    ext = guessed_ext or name_ext or ".bin"
+
     name = f"{secrets.token_hex(16)}{ext}"
     dst = GROUP_DIR / name
 
@@ -79,21 +82,49 @@ async def upload_image(file: UploadFile = File(...), request: Request = None):
 RECEIPTS_DIR = MEDIA_ROOT / "receipts"
 RECEIPTS_DIR.mkdir(parents=True, exist_ok=True)
 
+# Поддерживаем популярные варианты content-type для PDF
+_PDF_CTYPES = {
+    "application/pdf",
+    "application/x-pdf",
+    "application/acrobat",
+    "applications/vnd.pdf",
+    "text/pdf",
+    "text/x-pdf",
+}
+# Набор распространённых расширений изображений (для fallback по имени файла)
+_IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".tif", ".tiff", ".heic", ".heif"}
+
 @router.post("/upload/receipt")
 async def upload_receipt(file: UploadFile = File(...), request: Request = None):
     """
-    Принимает image/* или application/pdf.
+    Принимает image/* или application/pdf (включая частые вариации).
     Сохраняет файл и возвращает абсолютный URL вида https://.../media/receipts/<random>.<ext>
     """
     ctype = (file.content_type or "").lower()
-    is_image = ctype.startswith("image/")
-    is_pdf = (ctype == "application/pdf")
+    filename = (file.filename or "")
+    name_ext = os.path.splitext(filename)[1].lower()
+
+    # Разрешаем:
+    #  - image по content-type или по расширению имени файла,
+    #  - pdf по известным content-type, по расширению .pdf, либо по octet-stream + .pdf
+    is_image = ctype.startswith("image/") or name_ext in _IMAGE_EXTS
+    is_pdf = (ctype in _PDF_CTYPES) or (name_ext == ".pdf") or (
+        ctype == "application/octet-stream" and name_ext == ".pdf"
+    )
 
     if not (is_image or is_pdf):
-        raise HTTPException(status_code=415, detail="Only image/* or application/pdf allowed")
+        raise HTTPException(
+            status_code=415,
+            detail=f"Only image/* or application/pdf allowed (got content-type='{ctype}', filename='{filename}')"
+        )
 
-    # Для PDF расширение фиксируем .pdf, для картинок — по mimetypes
-    ext = ".pdf" if is_pdf else (mimetypes.guess_extension(ctype) or ".bin")
+    # Для PDF — всегда .pdf; для картинок — по mimetypes либо по расширению
+    if is_pdf:
+        ext = ".pdf"
+    else:
+        guessed_ext = mimetypes.guess_extension(ctype) or ""
+        ext = guessed_ext or name_ext or ".bin"
+
     name = f"{secrets.token_hex(16)}{ext}"
     dst = RECEIPTS_DIR / name
 
