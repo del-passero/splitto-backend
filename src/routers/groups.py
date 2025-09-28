@@ -860,7 +860,3 @@ def delete_group_avatar(
     group.avatar_file_id = None
     group.avatar_updated_at = datetime.utcnow()
     db.commit()
-
-
-
-
