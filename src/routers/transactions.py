@@ -1,23 +1,27 @@
 # src/routers/transactions.py
 # -----------------------------------------------------------------------------
-# РОУТЕР: Транзакции
+# РОУТЕР: Транзакции (+ привязка/удаление чека с нормализацией URL)
 # -----------------------------------------------------------------------------
 from __future__ import annotations
 
 from decimal import Decimal, ROUND_HALF_UP
 from typing import List, Optional, Dict, Iterable, Set
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Response
+from fastapi import APIRouter, Depends, HTTPException, Query, Response, Request
 from starlette import status
 from sqlalchemy.orm import Session, selectinload, joinedload
 from sqlalchemy import select, func
+
+from pathlib import Path
+from urllib.parse import urlparse
+import os
 
 from src.db import get_db
 from src.models.transaction import Transaction
 from src.models.transaction_share import TransactionShare
 from src.models.currency import Currency
 from src.models.user import User
-from src.models.group import Group
+from src.models.group import Group, GroupStatus
 from src.models.group_member import GroupMember
 from src.schemas.transaction import TransactionCreate, TransactionUpdate, TransactionOut
 from src.schemas.user import UserOut
@@ -32,9 +36,11 @@ from src.utils.groups import (
     ensure_group_active,
 )
 
+from pydantic import BaseModel, constr
+
 router = APIRouter()
 
-# ===== Вспомогательные =====
+# ===== Общие вспомогательные (квантизация) ===================================
 
 def _quant_for_decimals(decimals: int) -> Decimal:
     if decimals <= 0:
@@ -49,6 +55,8 @@ def get_currency_decimals(db: Session, code: str) -> int:
     if not cur:
         raise HTTPException(status_code=404, detail="Currency not found")
     return int(cur.decimals or 2)
+
+# ===== Вспомогательные: связанные пользователи/валидаторы =====================
 
 def _involved_user_ids(tx: Transaction) -> Set[int]:
     ids: Set[int] = set()
@@ -102,12 +110,133 @@ def _require_membership_incl_deleted_group(db: Session, group_id: int, user_id: 
     if not is_member:
         raise HTTPException(status_code=403, detail="User is not a group member")
 
-# ===== Эндпоинты =====
+# ===== URL-медиа утилиты (скопировано по смыслу из groups.py) =================
+
+def _public_base_url(request: Request) -> str:
+    """
+    База для абсолютных ссылок: сначала PUBLIC_BASE_URL из окружения,
+    иначе — request.base_url.
+    """
+    base = os.getenv("PUBLIC_BASE_URL")
+    if base:
+        return base.rstrip("/")
+    return str(request.base_url).rstrip("/")
+
+def _to_abs_media_url(url: Optional[str], request: Request) -> Optional[str]:
+    """
+    Превращаем относительный путь ("/media/...", "receipts/...", "group_avatars/...") в абсолютный URL.
+    Абсолютные http(s) возвращаем как есть. Пустые — как есть.
+    """
+    if not url:
+        return url
+    s = str(url).strip()
+    if s.startswith("http://") or s.startswith("https://"):
+        return s
+
+    # Нормализуем путь
+    path = s if s.startswith("/") else f"/{s}"
+    if not path.startswith("/media/"):
+        if path.startswith("/receipts/") or path.startswith("/group_avatars/"):
+            path = f"/media{path}"
+        elif path.startswith("/media"):
+            if path != "/media":
+                path = "/media/" + path[len("/media/"):]
+        else:
+            path = f"/media{path}"
+
+    return f"{_public_base_url(request)}{path}"
+
+# ===== Работа с локальными файлами чеков (для аккуратного удаления) ==========
+
+def _pick_media_root_local() -> Path:
+    """
+    Дублируем логику выбора MEDIA_ROOT, чтобы мочь удалять локальные файлы чеков.
+    """
+    primary = Path(os.getenv("SPLITTO_MEDIA_ROOT") or "/data/uploads")
+    try:
+        primary.mkdir(parents=True, exist_ok=True)
+        return primary
+    except Exception:
+        fallback = Path(os.getenv("SPLITTO_MEDIA_FALLBACK") or os.path.abspath("./var/uploads"))
+        fallback.mkdir(parents=True, exist_ok=True)
+        return fallback
+
+MEDIA_ROOT = _pick_media_root_local()
+
+def _url_to_media_local_path_receipt(url: Optional[str]) -> Optional[Path]:
+    """
+    Преобразует абсолютный/относительный URL чека в путь в ФС,
+    но только если это внутри /media/receipts/.
+    Иначе возвращает None.
+    """
+    if not url:
+        return None
+    s = str(url).strip()
+
+    # Достаём path-часть
+    if s.startswith("http://") or s.startswith("https://"):
+        parsed = urlparse(s)
+        path = parsed.path or ""
+    else:
+        path = s
+
+    if not path:
+        return None
+    if not path.startswith("/"):
+        path = "/" + path
+
+    # Выделяем относительный путь внутри MEDIA_ROOT
+    rel: Optional[str] = None
+    if "/media/" in path:
+        rel = path.split("/media/", 1)[1]  # после "/media/"
+    elif path.startswith("/receipts/"):
+        rel = path[1:]  # "receipts/..."
+    elif path.startswith("receipts/"):
+        rel = path
+    else:
+        return None
+
+    # Разрешаем только receipts/
+    if not rel.startswith("receipts/"):
+        return None
+
+    local = (MEDIA_ROOT / rel)
+    try:
+        local_resolved = local.resolve()
+        media_resolved = MEDIA_ROOT.resolve()
+        _ = local_resolved.relative_to(media_resolved)  # безопасность: внутри MEDIA_ROOT
+    except Exception:
+        return None
+
+    return local
+
+def _delete_receipt_file_if_local(url: Optional[str]) -> bool:
+    """
+    Пытается удалить файл чека из локального хранилища, если он оттуда.
+    Возвращает True, если удалили; False — если ничего не делали/не вышло.
+    """
+    try:
+        p = _url_to_media_local_path_receipt(url)
+        if p and p.exists():
+            p.unlink()
+            return True
+        return False
+    except Exception:
+        return False
+
+# ===== Схемы для входа (привязка URL чека) ===================================
+
+class ReceiptUrlIn(BaseModel):
+    # принимаем любую непустую строку; относительную превратим в абсолютную
+    url: constr(strip_whitespace=True, min_length=1)
+
+# ===== Эндпоинты ==============================================================
 
 @router.get("/", response_model=List[TransactionOut])
 def get_transactions(
     db: Session = Depends(get_db),
     response: Response = None,
+    request: Request = None,
     current_user=Depends(get_current_telegram_user),
     group_id: Optional[int] = Query(None, description="Фильтр по группе"),
     user_id: Optional[int] = Query(None, description="Фильтр по пользователю (разрешён только current_user)"),
@@ -158,6 +287,9 @@ def get_transactions(
 
     for tx in items:
         _attach_related_users(db, tx)
+        # Нормализуем receipt_url в абсолютный
+        if getattr(tx, "receipt_url", None) and request is not None:
+            tx.receipt_url = _to_abs_media_url(tx.receipt_url, request)
 
     if response is not None:
         response.headers["X-Total-Count"] = str(total)
@@ -168,6 +300,7 @@ def get_transactions(
 def get_transaction(
     transaction_id: int,
     db: Session = Depends(get_db),
+    request: Request = None,
     current_user=Depends(get_current_telegram_user),
 ):
     tx = (
@@ -189,6 +322,8 @@ def get_transaction(
     _require_membership_incl_deleted_group(db, tx.group_id, current_user.id)
 
     _attach_related_users(db, tx)
+    if getattr(tx, "receipt_url", None) and request is not None:
+        tx.receipt_url = _to_abs_media_url(tx.receipt_url, request)
     return tx
 
 
@@ -382,6 +517,12 @@ def update_transaction(
         tx.category_id = None
         tx.paid_by = None
 
+    # --- Новое: поддержка receipt_* полей при апдейте (идемпотентно)
+    if hasattr(patch, "receipt_url") and patch.receipt_url is not None:
+        tx.receipt_url = (patch.receipt_url or None)
+    if hasattr(patch, "receipt_data") and patch.receipt_data is not None:
+        tx.receipt_data = (patch.receipt_data or None)
+
     db.query(TransactionShare).filter(TransactionShare.transaction_id == tx.id).delete()
     if aggregated_shares:
         shares_objs = []
@@ -437,6 +578,94 @@ def delete_transaction(
             },
         )
 
+    # Опционально: можно подчистить локальный файл чека при удалении транзакции
+    old_receipt = tx.receipt_url
+
     tx.is_deleted = True
+    tx.receipt_url = None
     db.commit()
+
+    # Пытаемся удалить локальный файл чека (если он наш и существовал)
+    _delete_receipt_file_if_local(old_receipt)
+
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+# ===== Новые эндпоинты: привязка/удаление чека ================================
+
+@router.post("/{transaction_id}/receipt/url", response_model=TransactionOut)
+def set_transaction_receipt_by_url(
+    transaction_id: int,
+    payload: ReceiptUrlIn,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_telegram_user),
+    request: Request = None,
+):
+    """
+    Привязка чека по URL (относительный нормализуем в абсолютный).
+    Доступ: любой участник активной группы.
+    """
+    tx = (
+        db.query(Transaction)
+        .options(
+            joinedload(Transaction.category),
+            selectinload(Transaction.shares),
+        )
+        .filter(Transaction.id == transaction_id, Transaction.is_deleted.is_(False))
+        .first()
+    )
+    if not tx:
+        raise HTTPException(status_code=404, detail="Транзакция не найдена")
+
+    group = require_membership(db, tx.group_id, current_user.id)
+    ensure_group_active(group)
+
+    old_url = tx.receipt_url
+
+    tx.receipt_url = _to_abs_media_url(payload.url, request)
+    db.commit()
+    db.refresh(tx)
+
+    # Если старый файл был локальным и отличается от нового — удаляем его из ФС
+    try:
+        old_local = _url_to_media_local_path_receipt(old_url)
+        new_local = _url_to_media_local_path_receipt(tx.receipt_url)
+        if old_local and (not new_local or old_local != new_local):
+            _delete_receipt_file_if_local(old_url)
+    except Exception:
+        pass
+
+    # На выдачу — уже абсолютный URL
+    if getattr(tx, "receipt_url", None) and request is not None:
+        tx.receipt_url = _to_abs_media_url(tx.receipt_url, request)
+    _attach_related_users(db, tx)
+    return tx
+
+
+@router.delete("/{transaction_id}/receipt", status_code=status.HTTP_204_NO_CONTENT)
+def delete_transaction_receipt(
+    transaction_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_telegram_user),
+):
+    """
+    Удаление привязанного чека (как у аватара группы):
+      - любой участник,
+      - только активная группа,
+      - обнуляем receipt_url (и по желанию можно очистить receipt_data),
+      - если файл локальный — пробуем удалить с диска.
+    """
+    tx = db.query(Transaction).filter(Transaction.id == transaction_id, Transaction.is_deleted.is_(False)).first()
+    if not tx:
+        return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+    group = require_membership(db, tx.group_id, current_user.id)
+    ensure_group_active(group)
+
+    old_url = tx.receipt_url
+
+    tx.receipt_url = None
+    # по желанию: tx.receipt_data = None
+    db.commit()
+
+    _delete_receipt_file_if_local(old_url)
     return Response(status_code=status.HTTP_204_NO_CONTENT)

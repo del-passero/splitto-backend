@@ -1,6 +1,7 @@
 # src/routers/upload.py
-# Эндпоинт загрузки изображений (аватары групп) в персистентное хранилище.
-# Файлы сохраняются в <MEDIA_ROOT>/group_avatars и отдаются по /media/group_avatars/<name>.
+# Эндпоинт загрузки изображений (аватары групп) + чеков (image/pdf) в персистентное хранилище.
+# Файлы сохраняются в <MEDIA_ROOT>/group_avatars и <MEDIA_ROOT>/receipts
+# и отдаются по /media/group_avatars/<name> и /media/receipts/<name>.
 
 from __future__ import annotations
 
@@ -30,10 +31,12 @@ def _pick_media_root() -> Path:
         return fallback
 
 MEDIA_ROOT = _pick_media_root()
+
+# --- Аватары групп ------------------------------------------------------------
 GROUP_DIR = MEDIA_ROOT / "group_avatars"
 GROUP_DIR.mkdir(parents=True, exist_ok=True)
 
-ALLOWED_PREFIXES = ("image/",)  # принимаем только image/*
+ALLOWED_PREFIXES = ("image/",)  # для /upload/image принимаем только image/*
 
 @router.post("/upload/image")
 async def upload_image(file: UploadFile = File(...)):
@@ -55,3 +58,33 @@ async def upload_image(file: UploadFile = File(...)):
 
     # Публичный URL — будет отдаваться через app.mount("/media", ...)
     return {"url": f"/media/group_avatars/{name}"}
+
+# --- Чеки транзакций ----------------------------------------------------------
+RECEIPTS_DIR = MEDIA_ROOT / "receipts"
+RECEIPTS_DIR.mkdir(parents=True, exist_ok=True)
+
+@router.post("/upload/receipt")
+async def upload_receipt(file: UploadFile = File(...)):
+    """
+    Принимает image/* или application/pdf.
+    Сохраняет файл в /media/receipts/<random>.<ext> и возвращает относительный URL.
+    """
+    ctype = (file.content_type or "").lower()
+    is_image = ctype.startswith("image/")
+    is_pdf = (ctype == "application/pdf")
+
+    if not (is_image or is_pdf):
+        raise HTTPException(status_code=415, detail="Only image/* or application/pdf allowed")
+
+    # Для PDF расширение фиксируем .pdf, для картинок — по mimetypes
+    ext = ".pdf" if is_pdf else (mimetypes.guess_extension(ctype) or ".bin")
+    name = f"{secrets.token_hex(16)}{ext}"
+    dst = RECEIPTS_DIR / name
+
+    try:
+        with dst.open("wb") as f:
+            shutil.copyfileobj(file.file, f)
+    finally:
+        await file.close()
+
+    return {"url": f"/media/receipts/{name}"}
