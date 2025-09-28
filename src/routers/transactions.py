@@ -110,17 +110,22 @@ def _require_membership_incl_deleted_group(db: Session, group_id: int, user_id: 
     if not is_member:
         raise HTTPException(status_code=403, detail="User is not a group member")
 
-# ===== URL-медиа утилиты (скопировано по смыслу из groups.py) =================
+# ===== URL-медиа утилиты ======================================================
 
 def _public_base_url(request: Request) -> str:
     """
-    База для абсолютных ссылок: сначала PUBLIC_BASE_URL из окружения,
-    иначе — request.base_url.
+    База для абсолютных ссылок:
+      1) PUBLIC_BASE_URL из окружения,
+      2) X-Forwarded-Proto/Host (за обратным прокси),
+      3) request.url.scheme/netloc.
     """
     base = os.getenv("PUBLIC_BASE_URL")
     if base:
         return base.rstrip("/")
-    return str(request.base_url).rstrip("/")
+
+    proto = request.headers.get("x-forwarded-proto") or request.url.scheme
+    host = request.headers.get("x-forwarded-host") or request.headers.get("host") or request.url.netloc
+    return f"{proto}://{host}".rstrip("/")
 
 def _to_abs_media_url(url: Optional[str], request: Request) -> Optional[str]:
     """

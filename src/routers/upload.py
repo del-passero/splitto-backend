@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 
-from fastapi import APIRouter, UploadFile, File, HTTPException
+from fastapi import APIRouter, UploadFile, File, HTTPException, Request
 from pathlib import Path
 import os
 import secrets
@@ -32,6 +32,21 @@ def _pick_media_root() -> Path:
 
 MEDIA_ROOT = _pick_media_root()
 
+def _public_base_url(request: Request) -> str:
+    """
+    Абсолютная база для публичных ссылок (HTTPS):
+      1) PUBLIC_BASE_URL из окружения (рекомендуется)
+      2) X-Forwarded-Proto/Host (за обратным прокси)
+      3) request.url.scheme/netloc
+    """
+    base = os.getenv("PUBLIC_BASE_URL")
+    if base:
+        return base.rstrip("/")
+
+    proto = request.headers.get("x-forwarded-proto") or request.url.scheme
+    host = request.headers.get("x-forwarded-host") or request.headers.get("host") or request.url.netloc
+    return f"{proto}://{host}".rstrip("/")
+
 # --- Аватары групп ------------------------------------------------------------
 GROUP_DIR = MEDIA_ROOT / "group_avatars"
 GROUP_DIR.mkdir(parents=True, exist_ok=True)
@@ -39,7 +54,7 @@ GROUP_DIR.mkdir(parents=True, exist_ok=True)
 ALLOWED_PREFIXES = ("image/",)  # для /upload/image принимаем только image/*
 
 @router.post("/upload/image")
-async def upload_image(file: UploadFile = File(...)):
+async def upload_image(file: UploadFile = File(...), request: Request = None):
     # Проверка content-type
     ctype = (file.content_type or "").lower()
     if not any(ctype.startswith(p) for p in ALLOWED_PREFIXES):
@@ -56,18 +71,19 @@ async def upload_image(file: UploadFile = File(...)):
     finally:
         await file.close()
 
-    # Публичный URL — будет отдаваться через app.mount("/media", ...)
-    return {"url": f"/media/group_avatars/{name}"}
+    # Публичный абсолютный URL (по HTTPS при корректной базе)
+    base = _public_base_url(request)
+    return {"url": f"{base}/media/group_avatars/{name}"}
 
 # --- Чеки транзакций ----------------------------------------------------------
 RECEIPTS_DIR = MEDIA_ROOT / "receipts"
 RECEIPTS_DIR.mkdir(parents=True, exist_ok=True)
 
 @router.post("/upload/receipt")
-async def upload_receipt(file: UploadFile = File(...)):
+async def upload_receipt(file: UploadFile = File(...), request: Request = None):
     """
     Принимает image/* или application/pdf.
-    Сохраняет файл в /media/receipts/<random>.<ext> и возвращает относительный URL.
+    Сохраняет файл и возвращает абсолютный URL вида https://.../media/receipts/<random>.<ext>
     """
     ctype = (file.content_type or "").lower()
     is_image = ctype.startswith("image/")
@@ -87,4 +103,5 @@ async def upload_receipt(file: UploadFile = File(...)):
     finally:
         await file.close()
 
-    return {"url": f"/media/receipts/{name}"}
+    base = _public_base_url(request)
+    return {"url": f"{base}/media/receipts/{name}"}
