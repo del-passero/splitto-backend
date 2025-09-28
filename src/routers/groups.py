@@ -37,6 +37,8 @@ from src.utils.groups import (
 
 import os
 import secrets
+from pathlib import Path
+from urllib.parse import urlparse
 
 router = APIRouter()
 
@@ -179,6 +181,84 @@ def _to_abs_media_url(url: Optional[str], request: Request) -> Optional[str]:
 
     base = _public_base_url(request)
     return f"{base}{path}"
+
+# --- Локальное хранилище (удаление старых аватаров) ---------------------------
+
+def _pick_media_root() -> Path:
+    """
+    Выбираем тот же корень, что и для StaticFiles/загрузок:
+      1) SPLITTO_MEDIA_ROOT (рекомендуется /data/uploads)
+      2) иначе пытаемся /data/uploads
+      3) если нет прав — ./var/uploads
+    """
+    primary = Path(os.getenv("SPLITTO_MEDIA_ROOT") or "/data/uploads")
+    try:
+        primary.mkdir(parents=True, exist_ok=True)
+        return primary
+    except Exception:
+        fallback = Path(os.getenv("SPLITTO_MEDIA_FALLBACK") or os.path.abspath("./var/uploads"))
+        fallback.mkdir(parents=True, exist_ok=True)
+        return fallback
+
+MEDIA_ROOT = _pick_media_root()
+
+def _url_to_media_local_path(url: Optional[str]) -> Optional[Path]:
+    """
+    Преобразует абсолютный/относительный URL аватара в путь в ФС,
+    но только если это внутри /media/group_avatars/.
+    Иначе возвращает None.
+    """
+    if not url:
+        return None
+    s = str(url).strip()
+
+    # Достаём path-часть
+    if s.startswith("http://") or s.startswith("https://"):
+        parsed = urlparse(s)
+        path = parsed.path or ""
+    else:
+        path = s
+
+    if not path:
+        return None
+    if not path.startswith("/"):
+        path = "/" + path
+
+    # Выделяем относительный путь внутри MEDIA_ROOT
+    rel: Optional[str] = None
+    if "/media/" in path:
+        rel = path.split("/media/", 1)[1]  # после "/media/"
+    elif path.startswith("/group_avatars/"):
+        rel = path[1:]
+    elif path.startswith("group_avatars/"):
+        rel = path
+    else:
+        return None
+
+    local = (MEDIA_ROOT / rel)
+    try:
+        local_resolved = local.resolve()
+        media_resolved = MEDIA_ROOT.resolve()
+        # безопасность: файл должен быть внутри MEDIA_ROOT
+        _ = local_resolved.relative_to(media_resolved)
+    except Exception:
+        return None
+
+    return local
+
+def _delete_avatar_file_if_local(url: Optional[str]) -> bool:
+    """
+    Пытается удалить файл аватара из локального хранилища, если он оттуда.
+    Возвращает True, если удалили; False — если ничего не делали/не вышло.
+    """
+    try:
+        p = _url_to_media_local_path(url)
+        if p and p.exists():
+            p.unlink()
+            return True
+        return False
+    except Exception:
+        return False
 
 # ===== Балансы / Settle-up ====================================================
 
@@ -832,12 +912,24 @@ def set_group_avatar_by_url(
     _require_membership_incl_deleted_group(db, group_id, current_user.id)
     ensure_group_active(group)
 
+    # запомним старый аватар, чтобы удалить файл (если локальный) после замены
+    old_url = group.avatar_url
+
     absolute_url = _to_abs_media_url(payload.url, request)
     group.avatar_url = str(absolute_url)
     group.avatar_file_id = None
     group.avatar_updated_at = datetime.utcnow()
     db.commit()
     db.refresh(group)
+
+    # Если старый файл был локальным и отличается от нового — удаляем его из ФС
+    try:
+        old_local = _url_to_media_local_path(old_url)
+        new_local = _url_to_media_local_path(group.avatar_url)
+        if old_local and (not new_local or old_local != new_local):
+            _delete_avatar_file_if_local(old_url)
+    except Exception:
+        pass
 
     # Отдаём уже нормализованное абсолютное
     group.avatar_url = _to_abs_media_url(group.avatar_url, request)
@@ -856,7 +948,13 @@ def delete_group_avatar(
     _require_membership_incl_deleted_group(db, group_id, current_user.id)
     ensure_group_active(group)
 
+    # сохраним, чтобы удалить файл после обнуления полей
+    old_url = group.avatar_url
+
     group.avatar_url = None
     group.avatar_file_id = None
     group.avatar_updated_at = datetime.utcnow()
     db.commit()
+
+    # пытаемся удалить локальный файл (если он из нашего /media/group_avatars)
+    _delete_avatar_file_if_local(old_url)
