@@ -1,88 +1,42 @@
-# src/routers/upload.py
+# backend/src/routers/upload.py
 # Эндпоинт загрузки изображений (аватары групп) + чеков (image/pdf) в персистентное хранилище.
 # Файлы сохраняются в <MEDIA_ROOT>/group_avatars и <MEDIA_ROOT>/receipts
 # и отдаются по /media/group_avatars/<name> и /media/receipts/<name>.
 
 from __future__ import annotations
 
-from fastapi import APIRouter, UploadFile, File, HTTPException, Request
-from pathlib import Path
 import os
 import secrets
-import shutil
 import mimetypes
+from pathlib import Path
+from typing import Optional
+
+from fastapi import APIRouter, UploadFile, File, HTTPException, Request, Depends
+
+from src.utils.telegram_dep import get_current_telegram_user
+from src.utils.media import (
+    MEDIA_ROOT,
+    ensure_dir,
+    public_base_url,
+    sniff_image_format,
+    is_pdf_bytes,
+    ext_for_image,
+)
 
 router = APIRouter()
 
-def _pick_media_root() -> Path:
-    """
-    Выбираем корень хранения:
-      1) SPLITTO_MEDIA_ROOT (в проде укажи /data/uploads)
-      2) иначе пробуем /data/uploads
-      3) если нет прав/папки — локальный ./var/uploads
-    """
-    primary = Path(os.getenv("SPLITTO_MEDIA_ROOT") or "/data/uploads")
-    try:
-        primary.mkdir(parents=True, exist_ok=True)
-        return primary
-    except Exception:
-        fallback = Path(os.getenv("SPLITTO_MEDIA_FALLBACK") or os.path.abspath("./var/uploads"))
-        fallback.mkdir(parents=True, exist_ok=True)
-        return fallback
+# ===== Настройки лимитов / директории ========================================
 
-MEDIA_ROOT = _pick_media_root()
+# общий лимит размера (можно переопределить env-переменной MAX_UPLOAD_MB)
+MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "10"))
+MAX_UPLOAD_BYTES = MAX_UPLOAD_MB * 1024 * 1024
+CHUNK_SIZE = 1024 * 1024  # 1MB
 
-def _public_base_url(request: Request) -> str:
-    """
-    Абсолютная база для публичных ссылок (HTTPS):
-      1) PUBLIC_BASE_URL из окружения (рекомендуется)
-      2) X-Forwarded-Proto/Host (за обратным прокси)
-      3) request.url.scheme/netloc
-    """
-    base = os.getenv("PUBLIC_BASE_URL")
-    if base:
-        return base.rstrip("/")
+# --- Поддиректории ------------------------------------------------------------
+GROUP_DIR = ensure_dir(MEDIA_ROOT / "group_avatars")
+RECEIPTS_DIR = ensure_dir(MEDIA_ROOT / "receipts")
 
-    proto = request.headers.get("x-forwarded-proto") or request.url.scheme
-    host = request.headers.get("x-forwarded-host") or request.headers.get("host") or request.url.netloc
-    return f"{proto}://{host}".rstrip("/")
-
-# --- Аватары групп ------------------------------------------------------------
-GROUP_DIR = MEDIA_ROOT / "group_avatars"
-GROUP_DIR.mkdir(parents=True, exist_ok=True)
-
-ALLOWED_PREFIXES = ("image/",)  # для /upload/image принимаем только image/*
-
-@router.post("/upload/image")
-async def upload_image(file: UploadFile = File(...), request: Request = None):
-    # Проверка content-type
-    ctype = (file.content_type or "").lower()
-    if not any(ctype.startswith(p) for p in ALLOWED_PREFIXES):
-        raise HTTPException(status_code=415, detail="Only image/* allowed")
-
-    # Генерация имени, определяем расширение (сFallbackом по исходному имени)
-    guessed_ext = mimetypes.guess_extension(ctype) or ""
-    name_ext = (os.path.splitext(file.filename or "")[1].lower() or "")
-    ext = guessed_ext or name_ext or ".bin"
-
-    name = f"{secrets.token_hex(16)}{ext}"
-    dst = GROUP_DIR / name
-
-    try:
-        with dst.open("wb") as f:
-            shutil.copyfileobj(file.file, f)
-    finally:
-        await file.close()
-
-    # Публичный абсолютный URL (по HTTPS при корректной базе)
-    base = _public_base_url(request)
-    return {"url": f"{base}/media/group_avatars/{name}"}
-
-# --- Чеки транзакций ----------------------------------------------------------
-RECEIPTS_DIR = MEDIA_ROOT / "receipts"
-RECEIPTS_DIR.mkdir(parents=True, exist_ok=True)
-
-# Поддерживаем популярные варианты content-type для PDF
+# --- Поддержка PDF content-types ---------------------------------------------
 _PDF_CTYPES = {
     "application/pdf",
     "application/x-pdf",
@@ -91,11 +45,79 @@ _PDF_CTYPES = {
     "text/pdf",
     "text/x-pdf",
 }
-# Набор распространённых расширений изображений (для fallback по имени файла)
 _IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".tif", ".tiff", ".heic", ".heif"}
 
+# ===== Маршруты ===============================================================
+
+# --- Аватары групп ------------------------------------------------------------
+
+@router.post("/upload/image")
+async def upload_image(
+    request: Request,
+    file: UploadFile = File(...),
+    current_user = Depends(get_current_telegram_user),  # авторизация обязательна
+):
+    # Базовая проверка content-type (для UX), но доверяем только magic bytes
+    ctype = (file.content_type or "").lower()
+    if not ctype.startswith("image/"):
+        # не блокируем только по заголовку — проверим magic ниже
+        pass
+
+    # Считываем head для sniff'а
+    head = await file.read(64 * 1024)
+    fmt = sniff_image_format(head)
+    if not fmt:
+        if is_pdf_bytes(head):
+            raise HTTPException(status_code=415, detail="PDF не поддерживается для /upload/image")
+        raise HTTPException(status_code=415, detail="Unsupported image format")
+
+    # Имя файла/расширение
+    name_ext = (os.path.splitext(file.filename or "")[1].lower() or "")
+    magic_ext = ext_for_image(fmt)
+    guessed_ext = mimetypes.guess_extension(ctype) or ""
+    ext = magic_ext or guessed_ext or name_ext or ".bin"
+    name = f"{secrets.token_hex(16)}{ext}"
+    dst = GROUP_DIR / name
+
+    # Пишем head + остаток, контролируя общий размер
+    total = 0
+    try:
+        with dst.open("wb") as f:
+            if head:
+                f.write(head)
+                total += len(head)
+                if total > MAX_UPLOAD_BYTES:
+                    raise HTTPException(status_code=413, detail=f"File too large (>{MAX_UPLOAD_MB} MB)")
+            while True:
+                chunk = await file.read(CHUNK_SIZE)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > MAX_UPLOAD_BYTES:
+                    raise HTTPException(status_code=413, detail=f"File too large (>{MAX_UPLOAD_MB} MB)")
+                f.write(chunk)
+    except HTTPException:
+        try:
+            if dst.exists():
+                dst.unlink(missing_ok=True)  # удалим частично записанный файл
+        except Exception:
+            pass
+        raise
+    finally:
+        await file.close()
+
+    base = public_base_url(request)
+    return {"url": f"{base}/media/group_avatars/{name}"}
+
+
+# --- Чеки транзакций ----------------------------------------------------------
+
 @router.post("/upload/receipt")
-async def upload_receipt(file: UploadFile = File(...), request: Request = None):
+async def upload_receipt(
+    request: Request,
+    file: UploadFile = File(...),
+    current_user = Depends(get_current_telegram_user),  # авторизация обязательна
+):
     """
     Принимает image/* или application/pdf (включая частые вариации).
     Сохраняет файл и возвращает абсолютный URL вида https://.../media/receipts/<random>.<ext>
@@ -104,35 +126,57 @@ async def upload_receipt(file: UploadFile = File(...), request: Request = None):
     filename = (file.filename or "")
     name_ext = os.path.splitext(filename)[1].lower()
 
-    # Разрешаем:
-    #  - image по content-type или по расширению имени файла,
-    #  - pdf по известным content-type, по расширению .pdf, либо по octet-stream + .pdf
-    is_image = ctype.startswith("image/") or name_ext in _IMAGE_EXTS
-    is_pdf = (ctype in _PDF_CTYPES) or (name_ext == ".pdf") or (
-        ctype == "application/octet-stream" and name_ext == ".pdf"
-    )
+    # Считываем head для надёжной идентификации
+    head = await file.read(64 * 1024)
 
-    if not (is_image or is_pdf):
+    # Определяем тип по magic; затем сверяем с content-type/расширением
+    is_pdf_magic = is_pdf_bytes(head)
+    img_fmt = sniff_image_format(head)
+
+    # Бизнес-правило: разрешаем либо PDF, либо изображение
+    is_pdf = is_pdf_magic or (ctype in _PDF_CTYPES) or (name_ext == ".pdf")
+    is_image = bool(img_fmt) or ctype.startswith("image/") or (name_ext in _IMAGE_EXTS)
+
+    if not (is_pdf or is_image):
         raise HTTPException(
             status_code=415,
             detail=f"Only image/* or application/pdf allowed (got content-type='{ctype}', filename='{filename}')"
         )
 
-    # Для PDF — всегда .pdf; для картинок — по mimetypes либо по расширению
+    # Расширение
     if is_pdf:
         ext = ".pdf"
     else:
-        guessed_ext = mimetypes.guess_extension(ctype) or ""
-        ext = guessed_ext or name_ext or ".bin"
+        ext = ext_for_image(img_fmt or "jpeg")
 
     name = f"{secrets.token_hex(16)}{ext}"
     dst = RECEIPTS_DIR / name
 
+    total = 0
     try:
         with dst.open("wb") as f:
-            shutil.copyfileobj(file.file, f)
+            if head:
+                f.write(head)
+                total += len(head)
+                if total > MAX_UPLOAD_BYTES:
+                    raise HTTPException(status_code=413, detail=f"File too large (>{MAX_UPLOAD_MB} MB)")
+            while True:
+                chunk = await file.read(CHUNK_SIZE)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > MAX_UPLOAD_BYTES:
+                    raise HTTPException(status_code=413, detail=f"File too large (>{MAX_UPLOAD_MB} MB)")
+                f.write(chunk)
+    except HTTPException:
+        try:
+            if dst.exists():
+                dst.unlink(missing_ok=True)
+        except Exception:
+            pass
+        raise
     finally:
         await file.close()
 
-    base = _public_base_url(request)
+    base = public_base_url(request)
     return {"url": f"{base}/media/receipts/{name}"}

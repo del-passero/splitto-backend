@@ -1,13 +1,17 @@
-# src/routers/groups.py
+# backend/src/routers/groups.py
 # -----------------------------------------------------------------------------
 # РОУТЕР: Группы
 # -----------------------------------------------------------------------------
 
 from __future__ import annotations
 
+import os
+import secrets
+from pathlib import Path
 from typing import List, Optional, Dict
 from datetime import datetime, date
 from decimal import Decimal
+from urllib.parse import urlparse
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response, Request
 from starlette import status
@@ -35,10 +39,12 @@ from src.utils.groups import (
     has_group_debts,
 )
 
-import os
-import secrets
-from pathlib import Path
-from urllib.parse import urlparse
+from src.utils.media import (
+    to_abs_media_url,
+    url_to_media_local_path,
+    delete_if_local,
+    public_base_url,   # может пригодиться в будущем
+)
 
 router = APIRouter()
 
@@ -116,161 +122,6 @@ def _has_active_transactions(db: Session, group_id: int) -> bool:
         Transaction.is_deleted == False
     ).first() is not None
 
-
-# --- Локальное хранилище (удаление старых аватаров) ---------------------------
-
-def _pick_media_root() -> Path:
-    """
-    Выбираем тот же корень, что и для StaticFiles/загрузок:
-      1) SPLITTO_MEDIA_ROOT (рекомендуется /data/uploads)
-      2) иначе пытаемся /data/uploads
-      3) если нет прав — ./var/uploads
-    """
-    primary = Path(os.getenv("SPLITTO_MEDIA_ROOT") or "/data/uploads")
-    try:
-        primary.mkdir(parents=True, exist_ok=True)
-        return primary
-    except Exception:
-        fallback = Path(os.getenv("SPLITTO_MEDIA_FALLBACK") or os.path.abspath("./var/uploads"))
-        fallback.mkdir(parents=True, exist_ok=True)
-        return fallback
-
-MEDIA_ROOT = _pick_media_root()
-
-def _url_to_media_local_path(url: Optional[str]) -> Optional[Path]:
-    """
-    Преобразует абсолютный/относительный URL аватара в путь в ФС,
-    но только если это внутри /media/group_avatars/.
-    Иначе возвращает None.
-    """
-    if not url:
-        return None
-    s = str(url).strip()
-
-    # Достаём path-часть
-    if s.startswith("http://") or s.startswith("https://"):
-        parsed = urlparse(s)
-        path = parsed.path or ""
-    else:
-        path = s
-
-    if not path:
-        return None
-    if not path.startswith("/"):
-        path = "/" + path
-
-    # Выделяем относительный путь внутри MEDIA_ROOT
-    rel: Optional[str] = None
-    if "/media/" in path:
-        rel = path.split("/media/", 1)[1]  # после "/media/"
-    elif path.startswith("/group_avatars/"):
-        rel = path[1:]
-    elif path.startswith("group_avatars/"):
-        rel = path
-    else:
-        return None
-
-    local = (MEDIA_ROOT / rel)
-    try:
-        local_resolved = local.resolve()
-        media_resolved = MEDIA_ROOT.resolve()
-        # безопасность: файл должен быть внутри MEDIA_ROOT
-        _ = local_resolved.relative_to(media_resolved)
-    except Exception:
-        return None
-
-    return local
-
-def _delete_avatar_file_if_local(url: Optional[str]) -> bool:
-    """
-    Пытается удалить файл аватара из локального хранилища, если он оттуда.
-    Возвращает True, если удалили; False — если ничего не делали/не вышло.
-    """
-    try:
-        p = _url_to_media_local_path(url)
-        if p and p.exists():
-            p.unlink()
-            return True
-        return False
-    except Exception:
-        return False
-
-
-def _hard_delete_group_impl(db: Session, group_id: int):
-    """
-    Жёсткое удаление зависимостей + самой группы. После успешного commit
-    пробуем удалить локальный файл аватара (если был и если локальный).
-    """
-    # Сохраним текущий аватар до удаления записи
-    group_row: Optional[Group] = db.query(Group).filter(Group.id == group_id).first()
-    avatar_url_before = getattr(group_row, "avatar_url", None) if group_row else None
-
-    # удаляем зависимые сущности
-    db.query(GroupHidden).filter(GroupHidden.group_id == group_id).delete(synchronize_session=False)
-    db.query(GroupInvite).filter(GroupInvite.group_id == group_id).delete(synchronize_session=False)
-    db.query(GroupMember).filter(GroupMember.group_id == group_id).delete(synchronize_session=False)
-    # удаляем саму группу
-    db.query(Group).filter(Group.id == group_id).delete(synchronize_session=False)
-    db.commit()
-
-    # после успешного commit — пытаемся удалить локальный файл
-    _delete_avatar_file_if_local(avatar_url_before)
-
-
-def _require_membership_incl_deleted_group(db: Session, group_id: int, user_id: int) -> None:
-    """
-    Проверяем, что пользователь состоит в группе (активный membership),
-    даже если группа archived/soft-deleted.
-    """
-    is_member = db.query(GroupMember.id).filter(
-        GroupMember.group_id == group_id,
-        GroupMember.user_id == user_id,
-        GroupMember.deleted_at.is_(None)
-    ).first()
-    if not is_member:
-        raise HTTPException(status_code=403, detail="Forbidden")
-
-
-# --- Нормализация медиа-URL ---------------------------------------------------
-
-def _public_base_url(request: Request) -> str:
-    """
-    База для абсолютных ссылок: сначала PUBLIC_BASE_URL из окружения,
-    иначе — request.base_url (учитывает X-Forwarded-* если настроен прокси).
-    """
-    base = os.getenv("PUBLIC_BASE_URL")
-    if base:
-        return base.rstrip("/")
-    return str(request.base_url).rstrip("/")
-
-def _to_abs_media_url(url: Optional[str], request: Request) -> Optional[str]:
-    """
-    Превращаем относительный путь ("/media/...", "group_avatars/...", "media/...") в абсолютный URL.
-    Абсолютные http(s) возвращаем как есть. Пустые — как есть.
-    """
-    if not url:
-        return url
-    s = str(url).strip()
-    if s.startswith("http://") or s.startswith("https://"):
-        return s
-
-    # Нормализуем путь
-    path = s
-    if not path.startswith("/"):
-        path = "/" + path
-    # если забыли /media — добавим
-    if not path.startswith("/media/"):
-        if path.startswith("/group_avatars/"):
-            path = "/media" + path
-        elif path.startswith("/media"):
-            # например "/media" без завершающего слэша
-            if path != "/media":
-                path = "/media/" + path[len("/media/"):]
-        else:
-            path = "/media" + path
-
-    base = _public_base_url(request)
-    return f"{base}{path}"
 
 # ===== Балансы / Settle-up ====================================================
 
@@ -537,7 +388,7 @@ def get_groups_for_user(
             "last_activity_at": last_dates.get(group.id),
             "is_hidden": is_hidden,
             # ---- аватар: отдаём абсолютный URL --------------------------------
-            "avatar_url": _to_abs_media_url(group.avatar_url, request),
+            "avatar_url": to_abs_media_url(group.avatar_url, request),
         })
 
     return result
@@ -564,7 +415,7 @@ def group_detail(
 
     # Нормализуем аватар в абсолютный URL для ответа (БД не трогаем)
     if getattr(group, "avatar_url", None):
-        group.avatar_url = _to_abs_media_url(group.avatar_url, request)
+        group.avatar_url = to_abs_media_url(group.avatar_url, request)
 
     group.members = members
     return group
@@ -721,6 +572,27 @@ def restore_group(
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 # ===== Hard-delete ============================================================
+
+def _hard_delete_group_impl(db: Session, group_id: int):
+    """
+    Жёсткое удаление зависимостей + самой группы. После успешного commit
+    пробуем удалить локальный файл аватара (если был и если локальный).
+    """
+    # Сохраним текущий аватар до удаления записи
+    group_row: Optional[Group] = db.query(Group).filter(Group.id == group_id).first()
+    avatar_url_before = getattr(group_row, "avatar_url", None) if group_row else None
+
+    # удаляем зависимые сущности
+    db.query(GroupHidden).filter(GroupHidden.group_id == group_id).delete(synchronize_session=False)
+    db.query(GroupInvite).filter(GroupInvite.group_id == group_id).delete(synchronize_session=False)
+    db.query(GroupMember).filter(GroupMember.group_id == group_id).delete(synchronize_session=False)
+    # удаляем саму группу
+    db.query(Group).filter(Group.id == group_id).delete(synchronize_session=False)
+    db.commit()
+
+    # после успешного commit — пытаемся удалить локальный файл (только из group_avatars)
+    delete_if_local(avatar_url_before, allowed_subdirs=("group_avatars",))
+
 
 @router.delete("/{group_id}/hard", status_code=status.HTTP_204_NO_CONTENT)
 def hard_delete_group(
@@ -927,7 +799,7 @@ def set_group_avatar_by_url(
     # запомним старый аватар, чтобы удалить файл (если локальный) после замены
     old_url = group.avatar_url
 
-    absolute_url = _to_abs_media_url(payload.url, request)
+    absolute_url = to_abs_media_url(payload.url, request)
     group.avatar_url = str(absolute_url)
     group.avatar_file_id = None
     group.avatar_updated_at = datetime.utcnow()
@@ -936,15 +808,15 @@ def set_group_avatar_by_url(
 
     # Если старый файл был локальным и отличается от нового — удаляем его из ФС
     try:
-        old_local = _url_to_media_local_path(old_url)
-        new_local = _url_to_media_local_path(group.avatar_url)
+        old_local = url_to_media_local_path(old_url, allowed_subdirs=("group_avatars",))
+        new_local = url_to_media_local_path(group.avatar_url, allowed_subdirs=("group_avatars",))
         if old_local and (not new_local or old_local != new_local):
-            _delete_avatar_file_if_local(old_url)
+            delete_if_local(old_url, allowed_subdirs=("group_avatars",))
     except Exception:
         pass
 
     # Отдаём уже нормализованное абсолютное
-    group.avatar_url = _to_abs_media_url(group.avatar_url, request)
+    group.avatar_url = to_abs_media_url(group.avatar_url, request)
     return group
 
 # ===== Аватар группы: удаление (любой участник активной группы) ==============
@@ -969,4 +841,20 @@ def delete_group_avatar(
     db.commit()
 
     # пытаемся удалить локальный файл (если он из нашего /media/group_avatars)
-    _delete_avatar_file_if_local(old_url)
+    delete_if_local(old_url, allowed_subdirs=("group_avatars",))
+
+
+# ===== Внутренние проверки членства (оставлены без изменений) =================
+
+def _require_membership_incl_deleted_group(db: Session, group_id: int, user_id: int) -> None:
+    """
+    Проверяем, что пользователь состоит в группе (активный membership),
+    даже если группа archived/soft-deleted.
+    """
+    is_member = db.query(GroupMember.id).filter(
+        GroupMember.group_id == group_id,
+        GroupMember.user_id == user_id,
+        GroupMember.deleted_at.is_(None)
+    ).first()
+    if not is_member:
+        raise HTTPException(status_code=403, detail="Forbidden")
