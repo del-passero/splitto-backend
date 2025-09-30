@@ -12,10 +12,6 @@ from starlette import status
 from sqlalchemy.orm import Session, selectinload, joinedload
 from sqlalchemy import select, func
 
-from pathlib import Path
-from urllib.parse import urlparse
-import os
-
 from src.db import get_db
 from src.models.transaction import Transaction
 from src.models.transaction_share import TransactionShare
@@ -37,6 +33,13 @@ from src.utils.groups import (
 )
 
 from pydantic import BaseModel, constr
+
+# === Новое: общие медиа-утилиты ===============================================
+from src.utils.media import (
+    to_abs_media_url,
+    url_to_media_local_path,
+    delete_if_local,
+)
 
 router = APIRouter()
 
@@ -110,125 +113,6 @@ def _require_membership_incl_deleted_group(db: Session, group_id: int, user_id: 
     if not is_member:
         raise HTTPException(status_code=403, detail="User is not a group member")
 
-# ===== URL-медиа утилиты ======================================================
-
-def _public_base_url(request: Request) -> str:
-    """
-    База для абсолютных ссылок:
-      1) PUBLIC_BASE_URL из окружения,
-      2) X-Forwarded-Proto/Host (за обратным прокси),
-      3) request.url.scheme/netloc.
-    """
-    base = os.getenv("PUBLIC_BASE_URL")
-    if base:
-        return base.rstrip("/")
-
-    proto = request.headers.get("x-forwarded-proto") or request.url.scheme
-    host = request.headers.get("x-forwarded-host") or request.headers.get("host") or request.url.netloc
-    return f"{proto}://{host}".rstrip("/")
-
-def _to_abs_media_url(url: Optional[str], request: Request) -> Optional[str]:
-    """
-    Превращаем относительный путь ("/media/...", "receipts/...", "group_avatars/...") в абсолютный URL.
-    Абсолютные http(s) возвращаем как есть. Пустые — как есть.
-    """
-    if not url:
-        return url
-    s = str(url).strip()
-    if s.startswith("http://") or s.startswith("https://"):
-        return s
-
-    # Нормализуем путь
-    path = s if s.startswith("/") else f"/{s}"
-    if not path.startswith("/media/"):
-        if path.startswith("/receipts/") or path.startswith("/group_avatars/"):
-            path = f"/media{path}"
-        elif path.startswith("/media"):
-            if path != "/media":
-                path = "/media/" + path[len("/media/"):]
-        else:
-            path = f"/media{path}"
-
-    return f"{_public_base_url(request)}{path}"
-
-# ===== Работа с локальными файлами чеков (для аккуратного удаления) ==========
-
-def _pick_media_root_local() -> Path:
-    """
-    Дублируем логику выбора MEDIA_ROOT, чтобы мочь удалять локальные файлы чеков.
-    """
-    primary = Path(os.getenv("SPLITTO_MEDIA_ROOT") or "/data/uploads")
-    try:
-        primary.mkdir(parents=True, exist_ok=True)
-        return primary
-    except Exception:
-        fallback = Path(os.getenv("SPLITTO_MEDIA_FALLBACK") or os.path.abspath("./var/uploads"))
-        fallback.mkdir(parents=True, exist_ok=True)
-        return fallback
-
-MEDIA_ROOT = _pick_media_root_local()
-
-def _url_to_media_local_path_receipt(url: Optional[str]) -> Optional[Path]:
-    """
-    Преобразует абсолютный/относительный URL чека в путь в ФС,
-    но только если это внутри /media/receipts/.
-    Иначе возвращает None.
-    """
-    if not url:
-        return None
-    s = str(url).strip()
-
-    # Достаём path-часть
-    if s.startswith("http://") or s.startswith("https://"):
-        parsed = urlparse(s)
-        path = parsed.path or ""
-    else:
-        path = s
-
-    if not path:
-        return None
-    if not path.startswith("/"):
-        path = "/" + path
-
-    # Выделяем относительный путь внутри MEDIA_ROOT
-    rel: Optional[str] = None
-    if "/media/" in path:
-        rel = path.split("/media/", 1)[1]  # после "/media/"
-    elif path.startswith("/receipts/"):
-        rel = path[1:]  # "receipts/..."
-    elif path.startswith("receipts/"):
-        rel = path
-    else:
-        return None
-
-    # Разрешаем только receipts/
-    if not rel.startswith("receipts/"):
-        return None
-
-    local = (MEDIA_ROOT / rel)
-    try:
-        local_resolved = local.resolve()
-        media_resolved = MEDIA_ROOT.resolve()
-        _ = local_resolved.relative_to(media_resolved)  # безопасность: внутри MEDIA_ROOT
-    except Exception:
-        return None
-
-    return local
-
-def _delete_receipt_file_if_local(url: Optional[str]) -> bool:
-    """
-    Пытается удалить файл чека из локального хранилища, если он оттуда.
-    Возвращает True, если удалили; False — если ничего не делали/не вышло.
-    """
-    try:
-        p = _url_to_media_local_path_receipt(url)
-        if p and p.exists():
-            p.unlink()
-            return True
-        return False
-    except Exception:
-        return False
-
 # ===== Схемы для входа (привязка URL чека) ===================================
 
 class ReceiptUrlIn(BaseModel):
@@ -294,7 +178,7 @@ def get_transactions(
         _attach_related_users(db, tx)
         # Нормализуем receipt_url в абсолютный
         if getattr(tx, "receipt_url", None) and request is not None:
-            tx.receipt_url = _to_abs_media_url(tx.receipt_url, request)
+            tx.receipt_url = to_abs_media_url(tx.receipt_url, request)
 
     if response is not None:
         response.headers["X-Total-Count"] = str(total)
@@ -328,7 +212,7 @@ def get_transaction(
 
     _attach_related_users(db, tx)
     if getattr(tx, "receipt_url", None) and request is not None:
-        tx.receipt_url = _to_abs_media_url(tx.receipt_url, request)
+        tx.receipt_url = to_abs_media_url(tx.receipt_url, request)
     return tx
 
 
@@ -522,7 +406,7 @@ def update_transaction(
         tx.category_id = None
         tx.paid_by = None
 
-    # --- Новое: поддержка receipt_* полей при апдейте (идемпотентно)
+    # --- Поддержка receipt_* полей при апдейте (идемпотентно)
     if hasattr(patch, "receipt_url") and patch.receipt_url is not None:
         tx.receipt_url = (patch.receipt_url or None)
     if hasattr(patch, "receipt_data") and patch.receipt_data is not None:
@@ -583,7 +467,7 @@ def delete_transaction(
             },
         )
 
-    # Опционально: можно подчистить локальный файл чека при удалении транзакции
+    # Опционально: подчистим локальный файл чека при удалении транзакции
     old_receipt = tx.receipt_url
 
     tx.is_deleted = True
@@ -591,7 +475,7 @@ def delete_transaction(
     db.commit()
 
     # Пытаемся удалить локальный файл чека (если он наш и существовал)
-    _delete_receipt_file_if_local(old_receipt)
+    delete_if_local(old_receipt, allowed_subdirs=("receipts",))
 
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
@@ -626,22 +510,22 @@ def set_transaction_receipt_by_url(
 
     old_url = tx.receipt_url
 
-    tx.receipt_url = _to_abs_media_url(payload.url, request)
+    tx.receipt_url = to_abs_media_url(payload.url, request)
     db.commit()
     db.refresh(tx)
 
     # Если старый файл был локальным и отличается от нового — удаляем его из ФС
     try:
-        old_local = _url_to_media_local_path_receipt(old_url)
-        new_local = _url_to_media_local_path_receipt(tx.receipt_url)
+        old_local = url_to_media_local_path(old_url, allowed_subdirs=("receipts",))
+        new_local = url_to_media_local_path(tx.receipt_url, allowed_subdirs=("receipts",))
         if old_local and (not new_local or old_local != new_local):
-            _delete_receipt_file_if_local(old_url)
+            delete_if_local(old_url, allowed_subdirs=("receipts",))
     except Exception:
         pass
 
     # На выдачу — уже абсолютный URL
     if getattr(tx, "receipt_url", None) and request is not None:
-        tx.receipt_url = _to_abs_media_url(tx.receipt_url, request)
+        tx.receipt_url = to_abs_media_url(tx.receipt_url, request)
     _attach_related_users(db, tx)
     return tx
 
@@ -672,5 +556,5 @@ def delete_transaction_receipt(
     # по желанию: tx.receipt_data = None
     db.commit()
 
-    _delete_receipt_file_if_local(old_url)
+    delete_if_local(old_url, allowed_subdirs=("receipts",))
     return Response(status_code=status.HTTP_204_NO_CONTENT)
