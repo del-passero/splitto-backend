@@ -49,22 +49,49 @@ def _today_subdir() -> Path:
     return Path(f"{now:%Y}/{now:%m}")
 
 
-def _write_streamed(file: UploadFile, dst: Path) -> None:
-    """Записываем UploadFile в dst, контролируя общий размер и очищая частично записанное при ошибке."""
+async def _read_head(file: UploadFile, size: int = 64 * 1024) -> bytes:
+    """Читает head-байты и сохраняет их в file._head_bytes для последующей дозаписи."""
+    head = await file.read(size)
+    setattr(file, "_head_bytes", head)
+    return head
+
+
+def _pick_image_ext(head: bytes, ctype: str, name_ext: str) -> str:
+    """Определяем расширение для изображения: по magic, затем по content-type, затем по имени."""
+    fmt = sniff_image_format(head)
+    if not fmt:
+        if is_pdf_bytes(head):
+            # Явно говорим, что PDF не принимаем (для чеков)
+            raise HTTPException(status_code=415, detail="PDF не поддерживается. Прикрепляйте фото.")
+        raise HTTPException(status_code=415, detail="Unsupported image format")
+    magic_ext = ext_for_image(fmt)  # ожидаем что вернёт вроде '.jpg' и т.п.
+    guessed_ext = mimetypes.guess_extension(ctype or "") or ""
+    # приоритет magic -> guessed -> name (если из списка) -> .jpg по умолчанию
+    ext = magic_ext or guessed_ext or (name_ext if name_ext in _IMAGE_EXTS else "") or ".jpg"
+    return ext
+
+
+def _public_url(base: str, media_path: Path) -> str:
+    # media_path относительный к MEDIA_ROOT (например: group_avatars/2025/10/abcd.jpg)
+    return f"{base}/media/{media_path.as_posix()}"
+
+
+async def _write_streamed(file: UploadFile, dst: Path) -> None:
+    """Асинхронно пишет UploadFile в dst, контролируя общий размер.
+       Дописывает ранее прочитанный head и корректно закрывает файл.
+    """
     total = 0
     try:
         with dst.open("wb") as f:
-            # читаем head для сохранения того, что уже прочли у вызывающего кода
             head = getattr(file, "_head_bytes", b"")
             if head:
                 f.write(head)
                 total += len(head)
                 if total > MAX_UPLOAD_BYTES:
                     raise HTTPException(status_code=413, detail=f"File too large (>{MAX_UPLOAD_MB} MB)")
+
             while True:
-                chunk = file.read(CHUNK_SIZE)
-                if hasattr(chunk, "__await__"):  # если это async UploadFile.read в разных серверах
-                    chunk = yield from chunk.__await__()
+                chunk = await file.read(CHUNK_SIZE)  # ← ВАЖНО: асинхронное чтение
                 if not chunk:
                     break
                 total += len(chunk)
@@ -78,32 +105,11 @@ def _write_streamed(file: UploadFile, dst: Path) -> None:
         except Exception:
             pass
         raise
-
-
-async def _read_head(file: UploadFile, size: int = 64 * 1024) -> bytes:
-    head = await file.read(size)
-    # Сохраняем head, чтобы _write_streamed дописал его первым
-    setattr(file, "_head_bytes", head)
-    return head
-
-
-def _pick_image_ext(head: bytes, ctype: str, name_ext: str) -> str:
-    """Определяем расширение для изображения: по magic, затем по content-type, затем по имени."""
-    fmt = sniff_image_format(head)
-    if not fmt:
-        if is_pdf_bytes(head):
-            raise HTTPException(status_code=415, detail="PDF не поддерживается. Прикрепляйте фото.")
-        raise HTTPException(status_code=415, detail="Unsupported image format")
-    magic_ext = ext_for_image(fmt)
-    guessed_ext = mimetypes.guess_extension(ctype) or ""
-    # приоритет magic -> guessed -> name -> .jpg по умолчанию
-    ext = magic_ext or guessed_ext or (name_ext if name_ext in _IMAGE_EXTS else "") or ".jpg"
-    return ext
-
-
-def _public_url(base: str, media_path: Path) -> str:
-    # media_path относительный к MEDIA_ROOT (например: group_avatars/2025/10/abcd.jpg)
-    return f"{base}/media/{media_path.as_posix()}"
+    finally:
+        try:
+            await file.close()
+        except Exception:
+            pass
 
 
 # ===== Маршруты ===============================================================
@@ -120,9 +126,7 @@ async def upload_image(
     name_ext = (os.path.splitext(file.filename or "")[1].lower() or "")
 
     head = await _read_head(file)
-
-    # Определяем расширение строго как изображение (PDF отвергаем)
-    ext = _pick_image_ext(head, ctype, name_ext)
+    ext = _pick_image_ext(head, ctype, name_ext)  # PDF будет отвергнут внутри
 
     # Поддиректория по дате
     subdir = _today_subdir()
@@ -132,7 +136,6 @@ async def upload_image(
     dst_rel = Path("group_avatars") / subdir / name
     dst_abs = dst_dir / name
 
-    # Запись
     await _write_streamed(file, dst_abs)
 
     base = public_base_url(request)
@@ -156,9 +159,7 @@ async def upload_receipt(
     name_ext = (os.path.splitext(file.filename or "")[1].lower() or "")
 
     head = await _read_head(file)
-
-    # Разрешаем только изображение. Если это PDF — шлём понятную 415.
-    ext = _pick_image_ext(head, ctype, name_ext)
+    ext = _pick_image_ext(head, ctype, name_ext)  # если это PDF — вернём 415
 
     # Поддиректория по дате
     subdir = _today_subdir()
