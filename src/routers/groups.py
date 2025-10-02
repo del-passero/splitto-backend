@@ -9,6 +9,7 @@ import os
 import secrets
 from pathlib import Path
 from typing import List, Optional, Dict
+from typing import Literal  # добавлено
 from datetime import datetime, date
 from decimal import Decimal
 from urllib.parse import urlparse
@@ -28,7 +29,7 @@ from src.models.user import User
 from src.models.transaction import Transaction
 from src.models.group_hidden import GroupHidden
 from src.models.currency import Currency
-from src.schemas.group import GroupCreate, GroupOut
+from src.schemas.group import GroupCreate, GroupOut, GroupSettleAlgoEnum
 from src.schemas.group_invite import GroupInviteOut
 from src.schemas.group_member import GroupMemberOut
 from src.schemas.user import UserOut
@@ -153,7 +154,7 @@ def get_group_balances(
         return result
 
     code = (group.default_currency_code or "").upper()
-    balances = by_ccy.get(code, {uid: Decimal("0") for uid in member_ids})
+    balances = by_ccy.get(code, {uid: Decimal("0")for uid in member_ids})
     d = decimals_map.get(code, 2)
     return [{"user_id": uid, "balance": round(float(bal), d)} for uid, bal in balances.items()]
 
@@ -164,7 +165,12 @@ def get_group_settle_up(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_telegram_user),
     multicurrency: bool = Query(False, description="Вернуть граф выплат по каждой валюте отдельно"),
+    algorithm: Optional[Literal["greedy","pairs"]] = Query(None, description="Перекрыть алгоритм для предпросмотра"),
 ):
+    """
+    Возвращает план расчётов для группы.
+    По умолчанию использует group.settle_algorithm; можно временно переопределить query-параметром ?algorithm=.
+    """
     # Разрешаем для archived и soft-deleted
     _require_membership_incl_deleted_group(db, group_id, current_user.id)
     group = get_group_incl_deleted_or_404(db, group_id)
@@ -173,31 +179,45 @@ def get_group_settle_up(
     transactions = get_group_transactions(db, group_id)
 
     codes = sorted({(tx.currency_code or "").upper() for tx in transactions if tx.currency_code})
-    currencies = {c.code: int(c.decimals) for c in db.query(Currency).filter(Currency.code.in_(codes)).all()}
+    decimals_by_ccy = {c.code: int(c.decimals) for c in db.query(Currency).filter(Currency.code.in_(codes)).all()}
 
-    from src.utils.balance import (
-        calculate_group_balances_by_currency,
-        greedy_settle_up_single_currency,
+    # Алгоритм: query override > group setting > default
+    algo = (algorithm or getattr(group, "settle_algorithm", "greedy") or "greedy")
+    if isinstance(algo, str):
+        algo = algo.lower().strip()
+    if algo not in ("greedy", "pairs"):
+        algo = "greedy"
+
+    from src.utils.balance import build_settle_plan_by_algorithm
+    plan_all = build_settle_plan_by_algorithm(
+        transactions=transactions,
+        member_ids=member_ids,
+        decimals_by_ccy=decimals_by_ccy,
+        algorithm=algo,
     )
-    by_ccy = calculate_group_balances_by_currency(transactions, member_ids)
 
     if multicurrency:
-        result: Dict[str, List[Dict]] = {}
-        for code, balances in by_ccy.items():
-            d = currencies.get(code, 2)
-            result[code] = greedy_settle_up_single_currency(balances, d, code)
-        return result
+        # Группируем по валюте
+        out_by_ccy: Dict[str, List[Dict]] = {}
+        for item in plan_all:
+            code = item.get("currency_code") or (group.default_currency_code or "").upper()
+            out_by_ccy.setdefault(code, []).append(item)
+        return out_by_ccy
 
-    code = (group.default_currency_code or "").upper()
-    balances = by_ccy.get(code, {uid: Decimal("0") for uid in member_ids})
-    d = currencies.get(code, 2)
-    return greedy_settle_up_single_currency(balances, d, code)
+    # Оставляем только переводы в валюте группы по умолчанию
+    def_code = (group.default_currency_code or "").upper()
+    return [p for p in plan_all if (p.get("currency_code") or def_code) == def_code]
 
 # ===== Создание и базовые списки ==============================================
 
 @router.post("/", response_model=GroupOut)
 def create_group(group: GroupCreate, db: Session = Depends(get_db)):
-    db_group = Group(name=group.name, description=group.description, owner_id=group.owner_id)
+    db_group = Group(
+        name=group.name,
+        description=group.description,
+        owner_id=group.owner_id,
+        settle_algorithm=(group.settle_algorithm.value if hasattr(group.settle_algorithm, "value") else (group.settle_algorithm or "greedy")),
+    )
     db.add(db_group)
     db.commit()
     db.refresh(db_group)
@@ -686,9 +706,12 @@ def update_group_schedule(
     db.refresh(group)
     return group
 
+# === Обновление инфо группы (имя/описание + алгоритм settle-up) ==============
+
 class GroupUpdate(BaseModel):
   name: Optional[constr(strip_whitespace=True, min_length=1, max_length=120)] = None
   description: Optional[constr(strip_whitespace=True, max_length=500)] = None
+  settle_algorithm: Optional[Literal["greedy","pairs"]] = None  # добавлено
 
 @router.patch("/{group_id}", response_model=GroupOut)
 def update_group_info(
@@ -698,7 +721,7 @@ def update_group_info(
     current_user: User = Depends(get_current_telegram_user),
 ):
     """
-    Частичное обновление названия/описания группы.
+    Частичное обновление названия/описания/алгоритма группы.
     Доступ: любой участник. Только для активной группы.
     """
     group = get_group_or_404(db, group_id)
@@ -713,6 +736,12 @@ def update_group_info(
     if "description" in fields_set:
         desc = payload.description
         group.description = (desc if desc is not None and desc != "" else None)
+
+    if "settle_algorithm" in fields_set and payload.settle_algorithm is not None:
+        algo = (payload.settle_algorithm or "greedy").lower().strip()
+        if algo not in ("greedy", "pairs"):
+            raise HTTPException(status_code=422, detail="Invalid settle_algorithm")
+        group.settle_algorithm = algo
 
     db.commit()
     db.refresh(group)

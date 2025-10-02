@@ -28,6 +28,11 @@ class GroupStatus(enum.Enum):
     archived = "archived"
 
 
+class SettleAlgorithm(enum.Enum):
+    greedy = "greedy"
+    pairs = "pairs"
+
+
 class Group(Base):
     __tablename__ = "groups"
 
@@ -44,6 +49,15 @@ class Group(Base):
         default=GroupStatus.active,
         server_default=text("'active'"),
         comment="Статус группы: active|archived",
+    )
+
+    # Новый выбор алгоритма settle-up
+    settle_algorithm = Column(
+        Enum(SettleAlgorithm, name="settle_algorithm"),
+        nullable=False,
+        default=SettleAlgorithm.greedy,
+        server_default=text("'greedy'"),
+        comment="Алгоритм взаимозачёта: greedy|pairs",
     )
 
     archived_at = Column(
@@ -103,4 +117,5 @@ class Group(Base):
         Index("ix_groups_deleted_at", "deleted_at"),
         Index("ix_groups_end_date_auto_archive", "end_date", "auto_archive"),
         Index("ix_groups_default_currency_code", "default_currency_code"),
+        Index("ix_groups_settle_algorithm", "settle_algorithm"),
     )

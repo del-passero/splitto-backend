@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 from decimal import Decimal
-from typing import Callable, Iterable, Optional, Set, List, Dict
+from typing import Iterable, Optional, Set, List, Dict
 
 from fastapi import HTTPException
 from starlette import status
@@ -15,7 +15,6 @@ from ..models.group import Group, GroupStatus
 from ..models.group_member import GroupMember
 from ..models.group_category import GroupCategory
 from ..models.transaction import Transaction
-
 
 # =========================
 # БАЗОВЫЕ ГАРДЫ / ЗАГРУЗКИ
@@ -157,53 +156,23 @@ def _nets_by_currency_for_active(
     Знак согласован со вкладкой «Баланс»:
       • net > 0 — пользователю ДОЛЖНЫ;
       • net < 0 — он ДОЛЖЕН.
-    ВАЖНО: учитываем только взаимодействия МЕЖДУ активными участниками.
+    Учитываем только взаимодействия МЕЖДУ активными участниками.
     """
     member_ids = set(get_group_member_ids(db, group_id))
+    if not member_ids:
+        return {}
+
     txs = load_group_transactions(db, group_id)
 
-    nets: Dict[str, Dict[int, Decimal]] = {}
+    # ЕДИНЫЙ источник математики:
+    from ..utils.balance import calculate_group_balances_by_currency
+    nets_all = calculate_group_balances_by_currency(txs, member_ids)
 
-    for tx in txs:
-        code = (tx.currency_code or "").upper() or "XXX"
-        if code not in nets:
-            nets[code] = {uid: Decimal("0") for uid in member_ids}
-
-        # Расходы: каждый (кроме плательщика) должен плательщику свою долю.
-        if tx.type == "expense":
-            payer = tx.paid_by
-            if payer is None or payer not in member_ids:
-                continue
-            for share in tx.shares:
-                uid = share.user_id
-                if uid == payer:
-                    continue
-                if uid not in member_ids:
-                    # Доля неактивного участника игнорируется для проверок на выход/удаление.
-                    continue
-                amount = _D(getattr(share, "amount", 0))
-                nets[code][uid] -= amount      # участник должен
-                nets[code][payer] += amount    # плательщику должны
-
-        # Переводы: это ФАКТИЧЕСКИЙ РАСЧЁТ ДОЛГА.
-        # Денежный перевод A -> B на сумму X уменьшает долг A и уменьшает требование B.
-        elif tx.type == "transfer":
-            sender = getattr(tx, "transfer_from", None)
-            receivers: Iterable[int] = getattr(tx, "transfer_to", []) or []
-            amount = _D(getattr(tx, "amount", 0))
-
-            if sender is None or sender not in member_ids or amount == 0:
-                continue
-
-            for rid in receivers:
-                if rid not in member_ids or rid == sender:
-                    continue
-                nets[code][sender] += amount   # отправитель "меньше должен"
-                nets[code][rid]    -= amount   # получателю "меньше должны"
-
-        # Другие типы — не учитываем
-
-    return nets
+    # Возвращаем только активных (на случай, если транзакции содержат исторических пользователей)
+    out: Dict[str, Dict[int, Decimal]] = {}
+    for code, per_user in nets_all.items():
+        out[code] = {uid: per_user.get(uid, Decimal("0")) for uid in member_ids}
+    return out
 
 
 def has_group_debts(
