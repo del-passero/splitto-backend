@@ -9,7 +9,7 @@ import os
 import secrets
 from pathlib import Path
 from typing import List, Optional, Dict
-from typing import Literal  # добавлено
+from typing import Literal  # добавлено для settle_algorithm
 from datetime import datetime, date
 from decimal import Decimal
 from urllib.parse import urlparse
@@ -29,7 +29,7 @@ from src.models.user import User
 from src.models.transaction import Transaction
 from src.models.group_hidden import GroupHidden
 from src.models.currency import Currency
-from src.schemas.group import GroupCreate, GroupOut, GroupSettleAlgoEnum
+from src.schemas.group import GroupCreate, GroupOut  # схема уже содержит settle_algorithm
 from src.schemas.group_invite import GroupInviteOut
 from src.schemas.group_member import GroupMemberOut
 from src.schemas.user import UserOut
@@ -124,6 +124,12 @@ def _has_active_transactions(db: Session, group_id: int) -> bool:
     ).first() is not None
 
 
+def _ensure_str_description(group: Group) -> None:
+    """Гарантируем, что description не None (иначе Pydantic ругается на response_model)."""
+    if getattr(group, "description", None) is None:
+        group.description = ""
+
+
 # ===== Балансы / Settle-up ====================================================
 
 @router.get("/{group_id}/balances")
@@ -154,7 +160,7 @@ def get_group_balances(
         return result
 
     code = (group.default_currency_code or "").upper()
-    balances = by_ccy.get(code, {uid: Decimal("0")for uid in member_ids})
+    balances = by_ccy.get(code, {uid: Decimal("0") for uid in member_ids})
     d = decimals_map.get(code, 2)
     return [{"user_id": uid, "balance": round(float(bal), d)} for uid, bal in balances.items()]
 
@@ -165,7 +171,9 @@ def get_group_settle_up(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_telegram_user),
     multicurrency: bool = Query(False, description="Вернуть граф выплат по каждой валюте отдельно"),
-    algorithm: Optional[Literal["greedy","pairs"]] = Query(None, description="Перекрыть алгоритм для предпросмотра"),
+    algorithm: Optional[Literal["greedy", "pairs"]] = Query(
+        None, description="Перекрыть алгоритм для предпросмотра: greedy|pairs"
+    ),
 ):
     """
     Возвращает план расчётов для группы.
@@ -197,7 +205,7 @@ def get_group_settle_up(
     )
 
     if multicurrency:
-        # Группируем по валюте
+        # Группируем по валюте (если в айтеме нет кода — подставим валюту группы по умолчанию)
         out_by_ccy: Dict[str, List[Dict]] = {}
         for item in plan_all:
             code = item.get("currency_code") or (group.default_currency_code or "").upper()
@@ -214,13 +222,19 @@ def get_group_settle_up(
 def create_group(group: GroupCreate, db: Session = Depends(get_db)):
     db_group = Group(
         name=group.name,
-        description=group.description,
+        description=(group.description or ""),  # не допускаем None
         owner_id=group.owner_id,
-        settle_algorithm=(group.settle_algorithm.value if hasattr(group.settle_algorithm, "value") else (group.settle_algorithm or "greedy")),
+        # поддержка нового поля при создании (обратная совместимость, если поле отсутствует)
+        settle_algorithm=(
+            group.settle_algorithm.value
+            if hasattr(group, "settle_algorithm") and hasattr(group.settle_algorithm, "value")
+            else (getattr(group, "settle_algorithm", None) or "greedy")
+        ),
     )
     db.add(db_group)
     db.commit()
     db.refresh(db_group)
+    _ensure_str_description(db_group)
     add_member_to_group(db, db_group.id, db_group.owner_id)
     return db_group
 
@@ -231,7 +245,7 @@ def get_groups(
     limit: int = Query(100, ge=1, le=500),
     offset: int = Query(0, ge=0),
 ):
-    return (
+    groups = (
         db.query(Group)
         .filter(Group.deleted_at.is_(None))
         .order_by(Group.id.desc())
@@ -239,6 +253,10 @@ def get_groups(
         .offset(offset)
         .all()
     )
+    # normalize description
+    for g in groups:
+        _ensure_str_description(g)
+    return groups
 
 # ===== Группы пользователя (пагинация + поиск + X-Total-Count) ===============
 
@@ -379,6 +397,9 @@ def get_groups_for_user(
 
     result = []
     for group in page_groups:
+        # normalize description для сериализации
+        _ensure_str_description(group)
+
         gm_list = members_by_group.get(group.id, [])
         from src.schemas.group_member import GroupMemberOut
         from src.schemas.user import UserOut
@@ -433,7 +454,8 @@ def group_detail(
     )
     members = members_query.offset(offset).limit(limit).all() if limit is not None else members_query.all()
 
-    # Нормализуем аватар в абсолютный URL для ответа (БД не трогаем)
+    # Нормализуем поля для ответа
+    _ensure_str_description(group)
     if getattr(group, "avatar_url", None):
         group.avatar_url = to_abs_media_url(group.avatar_url, request)
 
@@ -509,6 +531,7 @@ def unarchive_group(
     group = require_owner(db, group_id, current_user.id)
     if group.status == GroupStatus.active:
         if return_full:
+            _ensure_str_description(group)
             return GroupOut.from_orm(group)
         return Response(status_code=status.HTTP_204_NO_CONTENT)
     group.status = GroupStatus.active
@@ -516,6 +539,7 @@ def unarchive_group(
     db.commit()
     if return_full:
         db.refresh(group)
+        _ensure_str_description(group)
         return GroupOut.from_orm(group)
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
@@ -579,6 +603,7 @@ def restore_group(
         raise HTTPException(status_code=403, detail="Only owner can perform this action")
     if group.deleted_at is None:
         if return_full:
+            _ensure_str_description(group)
             return GroupOut.from_orm(group)
         return Response(status_code=status.HTTP_204_NO_CONTENT)
 
@@ -588,6 +613,7 @@ def restore_group(
     db.commit()
     if return_full:
         db.refresh(group)
+        _ensure_str_description(group)
         return GroupOut.from_orm(group)
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
@@ -704,6 +730,7 @@ def update_group_schedule(
 
     db.commit()
     db.refresh(group)
+    _ensure_str_description(group)
     return group
 
 # === Обновление инфо группы (имя/описание + алгоритм settle-up) ==============
@@ -734,8 +761,13 @@ def update_group_info(
         group.name = payload.name
 
     if "description" in fields_set:
+        # Позволяем очищать описание пустой строкой; None больше не сохраняем
         desc = payload.description
-        group.description = (desc if desc is not None and desc != "" else None)
+        if desc is not None:
+            group.description = desc
+        else:
+            # если поле прислали, но None — оставляем как есть, не превращаем в None
+            pass
 
     if "settle_algorithm" in fields_set and payload.settle_algorithm is not None:
         algo = (payload.settle_algorithm or "greedy").lower().strip()
@@ -745,6 +777,7 @@ def update_group_info(
 
     db.commit()
     db.refresh(group)
+    _ensure_str_description(group)
     return group
 
 # ===== Батч-превью долгов для карточек =======================================
@@ -844,8 +877,9 @@ def set_group_avatar_by_url(
     except Exception:
         pass
 
-    # Отдаём уже нормализованное абсолютное
+    # Отдаём уже нормализованное абсолютное + description не None
     group.avatar_url = to_abs_media_url(group.avatar_url, request)
+    _ensure_str_description(group)
     return group
 
 # ===== Аватар группы: удаление (любой участник активной группы) ==============

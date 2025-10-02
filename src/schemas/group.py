@@ -6,7 +6,7 @@
 from __future__ import annotations
 
 from enum import Enum
-from typing import Optional, List, Literal
+from typing import Optional, List
 from datetime import date, datetime
 
 from pydantic import BaseModel, Field
@@ -26,7 +26,11 @@ class GroupSettleAlgoEnum(str, Enum):
 
 class GroupCreate(BaseModel):
     name: str = Field(..., description="Название группы")
-    description: str = Field("", description="Описание группы (необязательно)")
+    # принимаем и пустую строку, и null — сервер приведёт как захочет
+    description: Optional[str] = Field(
+        default=None,
+        description="Описание группы (необязательно)",
+    )
     owner_id: int = Field(..., description="ID владельца (может подменяться current_user на сервере)")
     # Новое: выбор алгоритма при создании (опционально; по умолчанию greedy)
     settle_algorithm: Optional[GroupSettleAlgoEnum] = Field(
@@ -38,7 +42,9 @@ class GroupCreate(BaseModel):
 class GroupOut(BaseModel):
     id: int = Field(..., description="ID группы")
     name: str = Field(..., description="Название группы")
-    description: str = Field("", description="Описание группы")
+    # 🔧 главное изменение: теперь Optional[str]
+    description: Optional[str] = Field(None, description="Описание группы")
+
     owner_id: Optional[int] = Field(None, description="ID владельца группы")
 
     status: GroupStatusEnum = Field(GroupStatusEnum.active, description="Статус: active|archived")
@@ -49,7 +55,7 @@ class GroupOut(BaseModel):
 
     default_currency_code: str = Field("USD", description="Код валюты ISO-4217 по умолчанию")
 
-    # Новый флаг алгоритма взаимозачёта
+    # Флаг алгоритма взаимозачёта
     settle_algorithm: GroupSettleAlgoEnum = Field(
         GroupSettleAlgoEnum.greedy,
         description="Алгоритм взаимозачёта: greedy|pairs",
