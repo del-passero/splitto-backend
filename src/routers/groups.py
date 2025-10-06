@@ -169,7 +169,19 @@ def get_group_settle_up(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_telegram_user),
     multicurrency: bool = Query(False, description="Вернуть граф выплат по каждой валюте отдельно"),
+    algorithm: Optional[str] = Query(
+        None,
+        description="Переопределить алгоритм группы: 'greedy' (быстрый) | 'pairs' (попарный)",
+    ),
 ):
+    """
+    План взаиморасчётов (settle-up).
+
+    • Если указан ?algorithm=greedy|pairs — используем его.
+      Иначе — берём алгоритм, сохранённый в группе.
+    • При multicurrency=true отдаём dict по всем валютам: { "USD": [...], "EUR": [...] }.
+      При multicurrency=false — список переводов только по default_currency_code группы.
+    """
     # Разрешаем для archived и soft-deleted
     _require_membership_incl_deleted_group(db, group_id, current_user.id)
     group = get_group_incl_deleted_or_404(db, group_id)
@@ -179,7 +191,10 @@ def get_group_settle_up(
 
     # карта точностей по валютам, присутствующим в транзакциях
     codes = sorted({(tx.currency_code or "").upper() for tx in transactions if tx.currency_code})
-    decimals_map = {c.code: int(c.decimals) for c in db.query(Currency).filter(Currency.code.in_(codes)).all()}
+    decimals_map = {
+        c.code: int(c.decimals)
+        for c in db.query(Currency).filter(Currency.code.in_(codes)).all()
+    }
 
     from src.utils.balance import (
         calculate_group_balances_by_currency,
@@ -188,37 +203,51 @@ def get_group_settle_up(
         pairwise_settle_up_single_currency,
     )
 
-    algo = (getattr(group, "settle_algorithm", None) or "greedy")
-    if hasattr(algo, "value"):
-        algo = algo.value
-    algo = str(algo).lower().strip()
+    # Алгоритм: query-параметр переопределяет сохранённый в группе
+    stored = (getattr(group, "settle_algorithm", None) or "greedy")
+    if hasattr(stored, "value"):
+        stored = stored.value
+    algo = (algorithm or str(stored) or "greedy").lower().strip()
+    if algo not in ("greedy", "pairs"):
+        raise HTTPException(status_code=422, detail="algorithm must be 'greedy' or 'pairs'")
 
+    # ----- MULTI-CURRENCY -----
     if multicurrency:
-        result: Dict[str, List[Dict]] = {}
+        if not transactions:
+            return {}  # по всем валютам пусто
+
         if algo == "pairs":
             debts_by_ccy = build_debts_matrix_by_currency(transactions, member_ids)
+            result: Dict[str, List[Dict]] = {}
             for code, matrix in debts_by_ccy.items():
                 d = int(decimals_map.get(code, 2))
                 result[code] = pairwise_settle_up_single_currency(matrix, d, currency_code=code)
-        else:
-            nets_by_ccy = calculate_group_balances_by_currency(transactions, member_ids)
-            for code, balances in nets_by_ccy.items():
-                d = int(decimals_map.get(code, 2))
-                result[code] = greedy_settle_up_single_currency(balances, d, code)
+            return result
+
+        # greedy
+        nets_by_ccy = calculate_group_balances_by_currency(transactions, member_ids)
+        result: Dict[str, List[Dict]] = {}
+        for code, balances in nets_by_ccy.items():
+            d = int(decimals_map.get(code, 2))
+            result[code] = greedy_settle_up_single_currency(balances, d, currency_code=code)
         return result
 
+    # ----- SINGLE-CURRENCY (default группы) -----
     code = (group.default_currency_code or "").upper()
+    if not transactions:
+        return []  # по дефолтной валюте пусто
+
     if algo == "pairs":
         debts_by_ccy = build_debts_matrix_by_currency(transactions, member_ids)
         d = int(decimals_map.get(code, 2))
         matrix = debts_by_ccy.get(code, {})
         return pairwise_settle_up_single_currency(matrix, d, currency_code=code)
 
+    # greedy
     nets_by_ccy = calculate_group_balances_by_currency(transactions, member_ids)
     balances = nets_by_ccy.get(code, {uid: Decimal("0") for uid in member_ids})
     d = int(decimals_map.get(code, 2))
-    return greedy_settle_up_single_currency(balances, d, code)
-
+    return greedy_settle_up_single_currency(balances, d, currency_code=code)
 
 # ===== Создание и базовые списки ==============================================
 
