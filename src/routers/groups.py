@@ -5,32 +5,27 @@
 
 from __future__ import annotations
 
-import os
-import secrets
-from pathlib import Path
 from typing import List, Optional, Dict
-from typing import Literal  # добавлено для settle_algorithm
 from datetime import datetime, date
 from decimal import Decimal
-from urllib.parse import urlparse
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response, Request
 from starlette import status
 from sqlalchemy.orm import Session, joinedload
-from sqlalchemy import func, select, cast
+from sqlalchemy import func, select, cast, or_
 from sqlalchemy.sql.sqltypes import DateTime
 from pydantic import BaseModel, constr  # AnyHttpUrl НЕ используем для входа, принимаем str
 
 from src.db import get_db
-from src.models.group import Group, GroupStatus
+from src.models.group import Group, GroupStatus, SettleAlgorithm
 from src.models.group_member import GroupMember
 from src.models.group_invite import GroupInvite
 from src.models.user import User
 from src.models.transaction import Transaction
+from src.models.transaction_share import TransactionShare
 from src.models.group_hidden import GroupHidden
 from src.models.currency import Currency
-from src.schemas.group import GroupCreate, GroupOut  # схема уже содержит settle_algorithm
-from src.schemas.group_invite import GroupInviteOut
+from src.schemas.group import GroupCreate, GroupOut, GroupSettleAlgoEnum
 from src.schemas.group_member import GroupMemberOut
 from src.schemas.user import UserOut
 from src.utils.telegram_dep import get_current_telegram_user
@@ -44,7 +39,6 @@ from src.utils.media import (
     to_abs_media_url,
     url_to_media_local_path,
     delete_if_local,
-    public_base_url,   # может пригодиться в будущем
 )
 
 router = APIRouter()
@@ -84,10 +78,17 @@ def get_group_member_ids(db: Session, group_id: int) -> List[int]:
 
 
 def get_group_transactions(db: Session, group_id: int) -> List[Transaction]:
+    """
+    ВАЖНО: учитываем старые записи с is_deleted = NULL как НЕ удалённые.
+    """
     return (
         db.query(Transaction)
-        .filter(Transaction.group_id == group_id, Transaction.is_deleted == False)
+        .filter(
+            Transaction.group_id == group_id,
+            or_(Transaction.is_deleted.is_(False), Transaction.is_deleted.is_(None)),
+        )
         .options(joinedload(Transaction.shares))
+        .order_by(Transaction.date.asc(), Transaction.id.asc())
         .all()
     )
 
@@ -118,16 +119,13 @@ def add_member_to_group(db: Session, group_id: int, user_id: int):
 
 
 def _has_active_transactions(db: Session, group_id: int) -> bool:
+    """
+    Считаем активными и записи с is_deleted = NULL (наследие до миграций).
+    """
     return db.query(Transaction.id).filter(
         Transaction.group_id == group_id,
-        Transaction.is_deleted == False
+        or_(Transaction.is_deleted.is_(False), Transaction.is_deleted.is_(None)),
     ).first() is not None
-
-
-def _ensure_str_description(group: Group) -> None:
-    """Гарантируем, что description не None (иначе Pydantic ругается на response_model)."""
-    if getattr(group, "description", None) is None:
-        group.description = ""
 
 
 # ===== Балансы / Settle-up ====================================================
@@ -171,14 +169,7 @@ def get_group_settle_up(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_telegram_user),
     multicurrency: bool = Query(False, description="Вернуть граф выплат по каждой валюте отдельно"),
-    algorithm: Optional[Literal["greedy", "pairs"]] = Query(
-        None, description="Перекрыть алгоритм для предпросмотра: greedy|pairs"
-    ),
 ):
-    """
-    Возвращает план расчётов для группы.
-    По умолчанию использует group.settle_algorithm; можно временно переопределить query-параметром ?algorithm=.
-    """
     # Разрешаем для archived и soft-deleted
     _require_membership_incl_deleted_group(db, group_id, current_user.id)
     group = get_group_incl_deleted_or_404(db, group_id)
@@ -186,55 +177,64 @@ def get_group_settle_up(
     member_ids = get_group_member_ids(db, group_id)
     transactions = get_group_transactions(db, group_id)
 
+    # карта точностей по валютам, присутствующим в транзакциях
     codes = sorted({(tx.currency_code or "").upper() for tx in transactions if tx.currency_code})
-    decimals_by_ccy = {c.code: int(c.decimals) for c in db.query(Currency).filter(Currency.code.in_(codes)).all()}
+    decimals_map = {c.code: int(c.decimals) for c in db.query(Currency).filter(Currency.code.in_(codes)).all()}
 
-    # Алгоритм: query override > group setting > default
-    algo = (algorithm or getattr(group, "settle_algorithm", "greedy") or "greedy")
-    if isinstance(algo, str):
-        algo = algo.lower().strip()
-    if algo not in ("greedy", "pairs"):
-        algo = "greedy"
-
-    from src.utils.balance import build_settle_plan_by_algorithm
-    plan_all = build_settle_plan_by_algorithm(
-        transactions=transactions,
-        member_ids=member_ids,
-        decimals_by_ccy=decimals_by_ccy,
-        algorithm=algo,
+    from src.utils.balance import (
+        calculate_group_balances_by_currency,
+        greedy_settle_up_single_currency,
+        build_debts_matrix_by_currency,
+        pairwise_settle_up_single_currency,
     )
 
-    if multicurrency:
-        # Группируем по валюте (если в айтеме нет кода — подставим валюту группы по умолчанию)
-        out_by_ccy: Dict[str, List[Dict]] = {}
-        for item in plan_all:
-            code = item.get("currency_code") or (group.default_currency_code or "").upper()
-            out_by_ccy.setdefault(code, []).append(item)
-        return out_by_ccy
+    algo = (getattr(group, "settle_algorithm", None) or "greedy")
+    if hasattr(algo, "value"):
+        algo = algo.value
+    algo = str(algo).lower().strip()
 
-    # Оставляем только переводы в валюте группы по умолчанию
-    def_code = (group.default_currency_code or "").upper()
-    return [p for p in plan_all if (p.get("currency_code") or def_code) == def_code]
+    if multicurrency:
+        result: Dict[str, List[Dict]] = {}
+        if algo == "pairs":
+            debts_by_ccy = build_debts_matrix_by_currency(transactions, member_ids)
+            for code, matrix in debts_by_ccy.items():
+                d = int(decimals_map.get(code, 2))
+                result[code] = pairwise_settle_up_single_currency(matrix, d, currency_code=code)
+        else:
+            nets_by_ccy = calculate_group_balances_by_currency(transactions, member_ids)
+            for code, balances in nets_by_ccy.items():
+                d = int(decimals_map.get(code, 2))
+                result[code] = greedy_settle_up_single_currency(balances, d, code)
+        return result
+
+    code = (group.default_currency_code or "").upper()
+    if algo == "pairs":
+        debts_by_ccy = build_debts_matrix_by_currency(transactions, member_ids)
+        d = int(decimals_map.get(code, 2))
+        matrix = debts_by_ccy.get(code, {})
+        return pairwise_settle_up_single_currency(matrix, d, currency_code=code)
+
+    nets_by_ccy = calculate_group_balances_by_currency(transactions, member_ids)
+    balances = nets_by_ccy.get(code, {uid: Decimal("0") for uid in member_ids})
+    d = int(decimals_map.get(code, 2))
+    return greedy_settle_up_single_currency(balances, d, code)
+
 
 # ===== Создание и базовые списки ==============================================
 
 @router.post("/", response_model=GroupOut)
 def create_group(group: GroupCreate, db: Session = Depends(get_db)):
+    # учитываем выбор settle_algorithm при создании (по умолчанию greedy)
+    incoming = getattr(group.settle_algorithm, "value", None) or str(group.settle_algorithm or "greedy")
     db_group = Group(
         name=group.name,
-        description=(group.description or ""),  # не допускаем None
+        description=group.description,
         owner_id=group.owner_id,
-        # поддержка нового поля при создании (обратная совместимость, если поле отсутствует)
-        settle_algorithm=(
-            group.settle_algorithm.value
-            if hasattr(group, "settle_algorithm") and hasattr(group.settle_algorithm, "value")
-            else (getattr(group, "settle_algorithm", None) or "greedy")
-        ),
+        settle_algorithm=SettleAlgorithm(incoming.lower().strip()),
     )
     db.add(db_group)
     db.commit()
     db.refresh(db_group)
-    _ensure_str_description(db_group)
     add_member_to_group(db, db_group.id, db_group.owner_id)
     return db_group
 
@@ -245,7 +245,7 @@ def get_groups(
     limit: int = Query(100, ge=1, le=500),
     offset: int = Query(0, ge=0),
 ):
-    groups = (
+    return (
         db.query(Group)
         .filter(Group.deleted_at.is_(None))
         .order_by(Group.id.desc())
@@ -253,10 +253,6 @@ def get_groups(
         .offset(offset)
         .all()
     )
-    # normalize description
-    for g in groups:
-        _ensure_str_description(g)
-    return groups
 
 # ===== Группы пользователя (пагинация + поиск + X-Total-Count) ===============
 
@@ -319,13 +315,13 @@ def get_groups_for_user(
     total = base_q.count()
     response.headers["X-Total-Count"] = str(int(total))
 
-    # Подзапрос last_tx_date
+    # Подзапрос last_tx_date (учитываем NULL в is_deleted)
     tx_dates_subq = (
         db.query(
             Transaction.group_id.label("g_id"),
             func.max(Transaction.date).label("last_tx_date"),
         )
-        .filter(Transaction.is_deleted == False)
+        .filter(or_(Transaction.is_deleted.is_(False), Transaction.is_deleted.is_(None)))
         .group_by(Transaction.group_id)
         .subquery()
     )
@@ -373,10 +369,11 @@ def get_groups_for_user(
 
     page_group_ids = {g.id for g in page_groups}
 
-    # Словарь last_activity_at
+    # Словарь last_activity_at (учитываем NULL в is_deleted)
     last_dates = dict(
         db.query(Transaction.group_id, func.max(Transaction.date))
-        .filter(Transaction.is_deleted == False, Transaction.group_id.in_(page_group_ids))
+        .filter(or_(Transaction.is_deleted.is_(False), Transaction.is_deleted.is_(None)),
+                Transaction.group_id.in_(page_group_ids))
         .group_by(Transaction.group_id)
         .all()
     )
@@ -397,12 +394,7 @@ def get_groups_for_user(
 
     result = []
     for group in page_groups:
-        # normalize description для сериализации
-        _ensure_str_description(group)
-
         gm_list = members_by_group.get(group.id, [])
-        from src.schemas.group_member import GroupMemberOut
-        from src.schemas.user import UserOut
         member_objs = [
             GroupMemberOut.from_orm(gm).dict() | {"user": UserOut.from_orm(user).dict()}
             for gm, user in gm_list
@@ -454,8 +446,7 @@ def group_detail(
     )
     members = members_query.offset(offset).limit(limit).all() if limit is not None else members_query.all()
 
-    # Нормализуем поля для ответа
-    _ensure_str_description(group)
+    # Нормализуем аватар в абсолютный URL для ответа (БД не трогаем)
     if getattr(group, "avatar_url", None):
         group.avatar_url = to_abs_media_url(group.avatar_url, request)
 
@@ -531,7 +522,6 @@ def unarchive_group(
     group = require_owner(db, group_id, current_user.id)
     if group.status == GroupStatus.active:
         if return_full:
-            _ensure_str_description(group)
             return GroupOut.from_orm(group)
         return Response(status_code=status.HTTP_204_NO_CONTENT)
     group.status = GroupStatus.active
@@ -539,7 +529,6 @@ def unarchive_group(
     db.commit()
     if return_full:
         db.refresh(group)
-        _ensure_str_description(group)
         return GroupOut.from_orm(group)
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
@@ -553,7 +542,7 @@ def soft_delete_group(
 ):
     """
     Удаление в один шаг:
-      • если НЕТ транзакций и группа НЕ soft → жестко удаляем сразу;
+      • если НЕТ транзакций и группа НЕ soft → жёстко удаляем сразу;
       • иначе, если НЕТ долгов → мягкое удаление (deleted_at=now);
       • иначе → 409.
     """
@@ -566,14 +555,14 @@ def soft_delete_group(
     has_tx = _has_active_transactions(db, group_id)
     has_debts_flag = has_group_debts(db, group_id)
 
-    # Если нет транзакций и НЕ soft → hard сразу
+    # Если нет активных транзакций и НЕ soft → hard сразу
     if not has_tx and group.deleted_at is None:
         if has_debts_flag:
             raise HTTPException(status_code=409, detail="В группе есть непогашенные долги")
         _hard_delete_group_impl(db, group_id)
         return
 
-    # Если есть транзакции — проверяем долги, затем soft
+    # Если есть активные транзакции — проверяем долги, затем soft
     if has_debts_flag:
         raise HTTPException(status_code=409, detail="В группе есть непогашенные долги")
 
@@ -603,7 +592,6 @@ def restore_group(
         raise HTTPException(status_code=403, detail="Only owner can perform this action")
     if group.deleted_at is None:
         if return_full:
-            _ensure_str_description(group)
             return GroupOut.from_orm(group)
         return Response(status_code=status.HTTP_204_NO_CONTENT)
 
@@ -613,7 +601,6 @@ def restore_group(
     db.commit()
     if return_full:
         db.refresh(group)
-        _ensure_str_description(group)
         return GroupOut.from_orm(group)
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
@@ -623,20 +610,30 @@ def _hard_delete_group_impl(db: Session, group_id: int):
     """
     Жёсткое удаление зависимостей + самой группы. После успешного commit
     пробуем удалить локальный файл аватара (если был и если локальный).
+
+    NB: сюда можно прийти как из DELETE /{id}/hard, так и из soft-delete,
+    когда активных транзакций нет (остались только soft-удалённые).
     """
     # Сохраним текущий аватар до удаления записи
     group_row: Optional[Group] = db.query(Group).filter(Group.id == group_id).first()
     avatar_url_before = getattr(group_row, "avatar_url", None) if group_row else None
 
-    # удаляем зависимые сущности
+    # 1) Сначала чистим шейры → транзакции (чтобы не ловить FK на transactions.group_id)
+    tx_ids = [tid for (tid,) in db.query(Transaction.id).filter(Transaction.group_id == group_id).all()]
+    if tx_ids:
+        db.query(TransactionShare).filter(TransactionShare.transaction_id.in_(tx_ids)).delete(synchronize_session=False)
+        db.query(Transaction).filter(Transaction.id.in_(tx_ids)).delete(synchronize_session=False)
+
+    # 2) Прочие зависимости группы
     db.query(GroupHidden).filter(GroupHidden.group_id == group_id).delete(synchronize_session=False)
     db.query(GroupInvite).filter(GroupInvite.group_id == group_id).delete(synchronize_session=False)
     db.query(GroupMember).filter(GroupMember.group_id == group_id).delete(synchronize_session=False)
-    # удаляем саму группу
+
+    # 3) Сама группа
     db.query(Group).filter(Group.id == group_id).delete(synchronize_session=False)
     db.commit()
 
-    # после успешного commit — пытаемся удалить локальный файл (только из group_avatars)
+    # После успешного commit — пытаемся удалить локальный файл (только из group_avatars)
     delete_if_local(avatar_url_before, allowed_subdirs=("group_avatars",))
 
 
@@ -693,6 +690,109 @@ def change_group_currency(
     group.default_currency_code = norm_code
     db.commit()
 
+# ===== Смена алгоритма settle-up (любой участник активной группы) ============
+
+class SettleAlgorithmUpdate(BaseModel):
+    settle_algorithm: GroupSettleAlgoEnum
+
+@router.patch("/{group_id}/settle-algorithm")
+def update_group_settle_algorithm(
+    group_id: int,
+    payload: SettleAlgorithmUpdate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_telegram_user),
+    return_full: bool = Query(False, description="Вернуть полную модель GroupOut вместо 204"),
+):
+    """
+    Меняет алгоритм взаимозачёта для группы:
+      • любой активный участник,
+      • только для ACTIVE группы,
+      • значения: greedy | pairs.
+    """
+    group = get_group_or_404(db, group_id)
+    _require_membership_incl_deleted_group(db, group_id, current_user.id)
+    ensure_group_active(group)
+
+    new_algo = SettleAlgorithm(
+        payload.settle_algorithm.value
+        if hasattr(payload.settle_algorithm, "value")
+        else str(payload.settle_algorithm).lower().strip()
+    )
+
+    if group.settle_algorithm != new_algo:
+        group.settle_algorithm = new_algo
+        db.commit()
+
+    if return_full:
+        db.refresh(group)
+        return GroupOut.from_orm(group)
+
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+# ===== Аватар группы: установка по URL (любой участник активной группы) ======
+
+class AvatarUrlIn(BaseModel):
+    # принимаем любую непустую строку; относительную превратим в абсолютную
+    url: constr(strip_whitespace=True, min_length=1)
+
+@router.post("/{group_id}/avatar/url", response_model=GroupOut)
+def set_group_avatar_by_url(
+    group_id: int,
+    payload: AvatarUrlIn,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_telegram_user),
+    request: Request = None,
+):
+    group = get_group_or_404(db, group_id)
+    _require_membership_incl_deleted_group(db, group_id, current_user.id)
+    ensure_group_active(group)
+
+    # запомним старый аватар, чтобы удалить файл (если локальный) после замены
+    old_url = group.avatar_url
+
+    absolute_url = to_abs_media_url(payload.url, request)
+    group.avatar_url = str(absolute_url)
+    group.avatar_file_id = None
+    group.avatar_updated_at = datetime.utcnow()
+    db.commit()
+    db.refresh(group)
+
+    # Если старый файл был локальным и отличается от нового — удаляем его из ФС
+    try:
+        old_local = url_to_media_local_path(old_url, allowed_subdirs=("group_avatars",))
+        new_local = url_to_media_local_path(group.avatar_url, allowed_subdirs=("group_avatars",))
+        if old_local and (not new_local or old_local != new_local):
+            delete_if_local(old_url, allowed_subdirs=("group_avatars",))
+    except Exception:
+        pass
+
+    # Отдаём уже нормализованное абсолютное
+    group.avatar_url = to_abs_media_url(group.avatar_url, request)
+    return group
+
+# ===== Аватар группы: удаление (любой участник активной группы) ==============
+
+@router.delete("/{group_id}/avatar", status_code=status.HTTP_204_NO_CONTENT)
+def delete_group_avatar(
+    group_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_telegram_user),
+):
+    group = get_group_or_404(db, group_id)
+    _require_membership_incl_deleted_group(db, group_id, current_user.id)
+    ensure_group_active(group)
+
+    # сохраним, чтобы удалить файл после обнуления полей
+    old_url = group.avatar_url
+
+    group.avatar_url = None
+    group.avatar_file_id = None
+    group.avatar_updated_at = datetime.utcnow()
+    db.commit()
+
+    # пытаемся удалить локальный файл (если он из нашего /media/group_avatars)
+    delete_if_local(old_url, allowed_subdirs=("group_avatars",))
+
 # ===== Расписание (end_date / auto_archive) ===================================
 
 class GroupScheduleUpdate(BaseModel):
@@ -730,15 +830,11 @@ def update_group_schedule(
 
     db.commit()
     db.refresh(group)
-    _ensure_str_description(group)
     return group
-
-# === Обновление инфо группы (имя/описание + алгоритм settle-up) ==============
 
 class GroupUpdate(BaseModel):
   name: Optional[constr(strip_whitespace=True, min_length=1, max_length=120)] = None
   description: Optional[constr(strip_whitespace=True, max_length=500)] = None
-  settle_algorithm: Optional[Literal["greedy","pairs"]] = None  # добавлено
 
 @router.patch("/{group_id}", response_model=GroupOut)
 def update_group_info(
@@ -748,7 +844,7 @@ def update_group_info(
     current_user: User = Depends(get_current_telegram_user),
 ):
     """
-    Частичное обновление названия/описания/алгоритма группы.
+    Частичное обновление названия/описания группы.
     Доступ: любой участник. Только для активной группы.
     """
     group = get_group_or_404(db, group_id)
@@ -761,23 +857,11 @@ def update_group_info(
         group.name = payload.name
 
     if "description" in fields_set:
-        # Позволяем очищать описание пустой строкой; None больше не сохраняем
         desc = payload.description
-        if desc is not None:
-            group.description = desc
-        else:
-            # если поле прислали, но None — оставляем как есть, не превращаем в None
-            pass
-
-    if "settle_algorithm" in fields_set and payload.settle_algorithm is not None:
-        algo = (payload.settle_algorithm or "greedy").lower().strip()
-        if algo not in ("greedy", "pairs"):
-            raise HTTPException(status_code=422, detail="Invalid settle_algorithm")
-        group.settle_algorithm = algo
+        group.description = (desc if desc is not None and desc != "" else None)
 
     db.commit()
     db.refresh(group)
-    _ensure_str_description(group)
     return group
 
 # ===== Батч-превью долгов для карточек =======================================
@@ -837,74 +921,6 @@ def get_debts_preview(
         result[str(gid)] = {"owe": owe, "owed": owed}
 
     return result
-
-
-# ===== Аватар группы: установка по URL (любой участник активной группы) ======
-
-class AvatarUrlIn(BaseModel):
-    # принимаем любую непустую строку; относительную превратим в абсолютную
-    url: constr(strip_whitespace=True, min_length=1)
-
-@router.post("/{group_id}/avatar/url", response_model=GroupOut)
-def set_group_avatar_by_url(
-    group_id: int,
-    payload: AvatarUrlIn,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_telegram_user),
-    request: Request = None,
-):
-    # было: group = require_owner(db, group_id, current_user.id)
-    group = get_group_or_404(db, group_id)
-    _require_membership_incl_deleted_group(db, group_id, current_user.id)
-    ensure_group_active(group)
-
-    # запомним старый аватар, чтобы удалить файл (если локальный) после замены
-    old_url = group.avatar_url
-
-    absolute_url = to_abs_media_url(payload.url, request)
-    group.avatar_url = str(absolute_url)
-    group.avatar_file_id = None
-    group.avatar_updated_at = datetime.utcnow()
-    db.commit()
-    db.refresh(group)
-
-    # Если старый файл был локальным и отличается от нового — удаляем его из ФС
-    try:
-        old_local = url_to_media_local_path(old_url, allowed_subdirs=("group_avatars",))
-        new_local = url_to_media_local_path(group.avatar_url, allowed_subdirs=("group_avatars",))
-        if old_local and (not new_local or old_local != new_local):
-            delete_if_local(old_url, allowed_subdirs=("group_avatars",))
-    except Exception:
-        pass
-
-    # Отдаём уже нормализованное абсолютное + description не None
-    group.avatar_url = to_abs_media_url(group.avatar_url, request)
-    _ensure_str_description(group)
-    return group
-
-# ===== Аватар группы: удаление (любой участник активной группы) ==============
-
-@router.delete("/{group_id}/avatar", status_code=status.HTTP_204_NO_CONTENT)
-def delete_group_avatar(
-    group_id: int,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_telegram_user),
-):
-    # было: group = require_owner(db, group_id, current_user.id)
-    group = get_group_or_404(db, group_id)
-    _require_membership_incl_deleted_group(db, group_id, current_user.id)
-    ensure_group_active(group)
-
-    # сохраним, чтобы удалить файл после обнуления полей
-    old_url = group.avatar_url
-
-    group.avatar_url = None
-    group.avatar_file_id = None
-    group.avatar_updated_at = datetime.utcnow()
-    db.commit()
-
-    # пытаемся удалить локальный файл (если он из нашего /media/group_avatars)
-    delete_if_local(old_url, allowed_subdirs=("group_avatars",))
 
 
 # ===== Внутренние проверки членства (оставлены без изменений) =================
