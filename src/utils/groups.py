@@ -4,11 +4,11 @@
 from __future__ import annotations
 
 from decimal import Decimal
-from typing import Iterable, Optional, Set, List, Dict
+from typing import Iterable, Optional, Set, List, Dict, Tuple
 
 from fastapi import HTTPException
 from starlette import status
-from sqlalchemy import select, func
+from sqlalchemy import select, func, desc
 from sqlalchemy.orm import Session, joinedload
 
 from ..models.group import Group, GroupStatus
@@ -178,7 +178,7 @@ def _nets_by_currency_for_active(
 def has_group_debts(
     db: Session,
     group_id: int,
-    *,
+    * ,
     precision: float = 0.01,
 ) -> bool:
     """
@@ -221,7 +221,7 @@ def ensure_member_can_leave(
     db: Session,
     group_id: int,
     user_id: int,
-    *,
+    * ,
     precision: float = 0.01,
 ) -> None:
     """
@@ -245,7 +245,7 @@ def ensure_member_can_be_removed(
     db: Session,
     group_id: int,
     target_user_id: int,
-    *,
+    * ,
     precision: float = 0.01,
 ) -> None:
     """
@@ -264,7 +264,7 @@ def ensure_member_can_be_removed(
 def ensure_group_can_be_deleted(
     db: Session,
     group_id: int,
-    *,
+    * ,
     precision: float = 0.01,
 ) -> None:
     """
@@ -279,4 +279,32 @@ def ensure_group_can_be_deleted(
             detail="Group has unsettled balances and cannot be deleted.",
         )
 
-    # Если сюда дошли — долгов среди активных участников нет, можно удалять.
+
+# =========================
+# ДОП. ХЕЛПЕРЫ ДЛЯ ДАШБОРДА
+# =========================
+
+def pick_last_currencies_for_user(
+    db: Session,
+    user_id: int,
+    limit: int = 2,
+) -> List[str]:
+    """
+    Две (или N) последних использованных пользователем валюты.
+    Источник — транзакции пользователя или его доли (shares) через join на transactions.
+    """
+    # Через транзакции, где user — автор
+    tx_currs = (
+        db.execute(
+            select(Transaction.currency_code, func.max(Transaction.date))
+            .where(
+                Transaction.created_by == user_id,
+                Transaction.is_deleted.is_(False),
+            )
+            .group_by(Transaction.currency_code)
+            .order_by(func.max(Transaction.date).desc())
+            .limit(limit)
+        )
+        .all()
+    )
+    return [ccy for (ccy, _) in tx_currs]

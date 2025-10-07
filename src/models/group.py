@@ -112,10 +112,21 @@ class Group(Base):
     )
     # -------------------------------------------------------------------------
 
+    # ------ Дата последней активности (для быстрых сортировок) ---------------
+    # Заполняется приложением (сервис/триггер): на любое событие/транзакцию в группе.
+    last_event_at = Column(
+        DateTime(timezone=True),
+        nullable=True,
+        comment="Последняя активность группы (UTC), денормализация для сортировок",
+    )
+    # -------------------------------------------------------------------------
+
     __table_args__ = (
         Index("ix_groups_status", "status"),
         Index("ix_groups_deleted_at", "deleted_at"),
         Index("ix_groups_end_date_auto_archive", "end_date", "auto_archive"),
         Index("ix_groups_default_currency_code", "default_currency_code"),
         Index("ix_groups_settle_algorithm", "settle_algorithm"),
+        # Новый индекс под последние активные группы
+        Index("ix_groups_last_event_at_desc", "last_event_at", postgresql_using="btree"),
     )
