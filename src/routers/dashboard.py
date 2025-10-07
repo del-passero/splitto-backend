@@ -4,9 +4,10 @@ from __future__ import annotations
 from datetime import date, timedelta
 from typing import Literal, Optional, Sequence
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, Query, Request
 from sqlalchemy import and_, desc, func, or_, select
 from sqlalchemy.orm import Session
+from sqlalchemy.sql import nulls_last  # для корректного ORDER BY ... NULLS LAST
 
 from src.db import get_db
 from src.utils.telegram_dep import get_current_telegram_user
@@ -29,6 +30,7 @@ from src.schemas.dashboard import (
     EventsFeedOut,
     EventFeedItemOut,
 )
+
 from src.utils.groups import pick_last_currencies_for_user
 
 router = APIRouter()
@@ -61,6 +63,36 @@ def _active_group_ids_for_user(db: Session, user_id: int) -> list[int]:
         )
     ).all()
     return [gid for (gid,) in rows]
+
+
+def _parse_accept_language(header: str | None) -> list[str]:
+    """
+    Примерно разбирает 'ru-RU,ru;q=0.9,en;q=0.8' -> ['ru', 'en'] (по убыванию q).
+    Упрощённо: вырезает регион и сортирует по q. Возвращает уникальные базовые коды.
+    """
+    if not header:
+        return []
+    parts: list[tuple[str, float]] = []
+    for chunk in header.split(","):
+        item = chunk.strip()
+        if not item:
+            continue
+        lang, *qpart = item.split(";")
+        base = lang.strip().lower().split("-")[0]
+        q = 1.0
+        if qpart:
+            try:
+                q = float(qpart[0].split("=")[1])
+            except Exception:
+                pass
+        parts.append((base, q))
+    seen: set[str] = set()
+    out: list[str] = []
+    for base, _q in sorted(parts, key=lambda x: x[1], reverse=True):
+        if base not in seen:
+            seen.add(base)
+            out.append(base)
+    return out
 
 
 # ------------------ /dashboard/balance ------------------
@@ -137,6 +169,7 @@ def get_dashboard_activity(
 
 @router.get("/top-categories", response_model=TopCategoriesOut)
 def get_top_categories(
+    request: Request,
     period: Literal["week", "month", "year"] = Query("month"),
     currency: Optional[str] = Query(None),
     limit: int = Query(50, ge=1, le=500),
@@ -150,6 +183,21 @@ def get_top_categories(
     if not group_ids:
         return TopCategoriesOut(period=period, items=[], total=0)
 
+    # Локали по приоритету: user.locale -> Accept-Language -> дефолты
+    locales: list[str] = []
+    user_locale = getattr(current_user, "locale", None)
+    if user_locale:
+        locales.append(str(user_locale).split("-")[0].lower())
+    locales += _parse_accept_language(request.headers.get("Accept-Language"))
+    for fb in ("en", "ru", "es"):
+        if fb not in locales:
+            locales.append(fb)
+    # уникализация с сохранением порядка
+    seen: set[str] = set()
+    locales = [x for x in locales if not (x in seen or seen.add(x))]
+    if not locales:
+        locales = ["en"]
+
     where_clause = [
         Transaction.group_id.in_(group_ids),
         Transaction.is_deleted.is_(False),
@@ -160,17 +208,26 @@ def get_top_categories(
     if currency:
         where_clause.append(Transaction.currency_code == currency)
 
-    sum_amount = func.sum(Transaction.amount)
+    # COALESCE(name_i18n['xx']::text, ..., key) AS name
+    name_candidates = [ExpenseCategory.name_i18n[loc].astext for loc in locales]
+    cat_name_expr = func.coalesce(*name_candidates, ExpenseCategory.key).label("name")
+
+    sum_amount = func.sum(Transaction.amount).label("sum_amount")
+
     base = (
         select(
-            Transaction.category_id,
-            ExpenseCategory.name,
-            Transaction.currency_code,
-            sum_amount.label("sum_amount"),
+            Transaction.category_id.label("category_id"),
+            cat_name_expr,  # важно — тот же expr в GROUP BY
+            Transaction.currency_code.label("currency"),
+            sum_amount,
         )
         .join(ExpenseCategory, ExpenseCategory.id == Transaction.category_id)
         .where(and_(*where_clause))
-        .group_by(Transaction.category_id, ExpenseCategory.name, Transaction.currency_code)
+        .group_by(
+            Transaction.category_id,
+            cat_name_expr,
+            Transaction.currency_code,
+        )
         .order_by(desc(sum_amount))
     )
 
@@ -178,8 +235,13 @@ def get_top_categories(
     rows = db.execute(base.offset(offset).limit(limit)).all()
 
     items = [
-        TopCategoryItemOut(category_id=cid, name=name, sum=f"{s or 0:.2f}", currency=ccy)
-        for (cid, name, ccy, s) in rows
+        TopCategoryItemOut(
+            category_id=row.category_id,
+            name=row.name,
+            sum=f"{(row.sum_amount or 0):.2f}",
+            currency=row.currency,
+        )
+        for row in rows
     ]
     return TopCategoriesOut(period=period, items=items, total=int(total))
 
@@ -252,11 +314,15 @@ def get_recent_groups(
             Group.deleted_at.is_(None),
             Group.status == GroupStatus.active,
         )
-        .order_by(desc(Group.last_event_at.nullslast()), desc(Group.id))
+        # ВАЖНО: правильный синтаксис NULLS LAST для Postgres
+        .order_by(
+            nulls_last(Group.last_event_at.desc()),
+            Group.id.desc(),
+        )
         .limit(limit)
     ).scalars().all()
 
-    out = []
+    out: list[RecentGroupCardOut] = []
     for g in rows:
         sums = db.execute(
             select(Transaction.currency_code, func.sum(TransactionShare.amount))
