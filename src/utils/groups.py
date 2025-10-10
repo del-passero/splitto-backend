@@ -8,7 +8,7 @@ from typing import Iterable, Optional, Set, List, Dict, Tuple
 
 from fastapi import HTTPException
 from starlette import status
-from sqlalchemy import select, func, desc
+from sqlalchemy import select, func, or_
 from sqlalchemy.orm import Session, joinedload
 
 from ..models.group import Group, GroupStatus
@@ -126,12 +126,13 @@ def load_group_transactions(db: Session, group_id: int) -> List[Transaction]:
     Загружает активные транзакции группы с подгруженными долями.
     Для joinedload коллекций используем .unique() перед .scalars()
     (SQLAlchemy 2.x) чтобы убрать дубли.
+    Учитываем исторические записи с is_deleted = NULL как «не удалённые».
     """
     stmt = (
         select(Transaction)
         .where(
             Transaction.group_id == group_id,
-            Transaction.is_deleted.is_(False),
+            or_(Transaction.is_deleted.is_(False), Transaction.is_deleted.is_(None)),
         )
         .options(joinedload(Transaction.shares))
         .order_by(Transaction.date.asc(), Transaction.id.asc())
@@ -292,6 +293,7 @@ def pick_last_currencies_for_user(
     """
     Две (или N) последних использованных пользователем валюты.
     Источник — транзакции пользователя или его доли (shares) через join на transactions.
+    Учитываем исторические записи с is_deleted = NULL как «не удалённые».
     """
     # Через транзакции, где user — автор
     tx_currs = (
@@ -299,7 +301,7 @@ def pick_last_currencies_for_user(
             select(Transaction.currency_code, func.max(Transaction.date))
             .where(
                 Transaction.created_by == user_id,
-                Transaction.is_deleted.is_(False),
+                or_(Transaction.is_deleted.is_(False), Transaction.is_deleted.is_(None)),
             )
             .group_by(Transaction.currency_code)
             .order_by(func.max(Transaction.date).desc())

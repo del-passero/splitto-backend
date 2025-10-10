@@ -7,7 +7,6 @@ from typing import Literal, Optional, Sequence
 from fastapi import APIRouter, Depends, Query, Request
 from sqlalchemy import and_, desc, func, or_, select
 from sqlalchemy.orm import Session
-from sqlalchemy.sql import nulls_last  # для корректного ORDER BY ... NULLS LAST
 
 from src.db import get_db
 from src.utils.telegram_dep import get_current_telegram_user
@@ -34,7 +33,6 @@ from src.schemas.dashboard import (
 from src.utils.groups import pick_last_currencies_for_user
 
 router = APIRouter()
-
 
 # ------------------ helpers ------------------
 
@@ -66,10 +64,6 @@ def _active_group_ids_for_user(db: Session, user_id: int) -> list[int]:
 
 
 def _parse_accept_language(header: str | None) -> list[str]:
-    """
-    Примерно разбирает 'ru-RU,ru;q=0.9,en;q=0.8' -> ['ru', 'en'] (по убыванию q).
-    Упрощённо: вырезает регион и сортирует по q. Возвращает уникальные базовые коды.
-    """
     if not header:
         return []
     parts: list[tuple[str, float]] = []
@@ -94,6 +88,9 @@ def _parse_accept_language(header: str | None) -> list[str]:
             out.append(base)
     return out
 
+# Удобная «маска» для активных транзакций с учётом исторических NULL
+def _is_active_tx():
+    return or_(Transaction.is_deleted.is_(False), Transaction.is_deleted.is_(None))
 
 # ------------------ /dashboard/balance ------------------
 
@@ -113,7 +110,7 @@ def get_dashboard_balance(
         .join(Transaction, Transaction.id == TransactionShare.transaction_id)
         .where(
             Transaction.group_id.in_(group_ids),
-            Transaction.is_deleted.is_(False),
+            _is_active_tx(),
             TransactionShare.user_id == current_user.id,
         )
         .group_by(Transaction.currency_code)
@@ -134,12 +131,11 @@ def get_dashboard_balance(
     last_currencies = pick_last_currencies_for_user(db, current_user.id, limit=2)
     return DashboardBalanceOut(i_owe=i_owe, they_owe_me=they_owe_me, last_currencies=last_currencies)
 
-
 # ------------------ /dashboard/activity ------------------
 
 @router.get("/activity", response_model=DashboardActivityOut)
 def get_dashboard_activity(
-    period: Literal["week", "month", "year"] = Query("month"),
+    period: Literal["day", "week", "month", "year"] = Query("month"),
     db: Session = Depends(get_db),
     current_user=Depends(get_current_telegram_user),
 ):
@@ -153,7 +149,7 @@ def get_dashboard_activity(
         select(Transaction.date, func.count(Transaction.id))
         .where(
             Transaction.group_id.in_(group_ids),
-            Transaction.is_deleted.is_(False),
+            _is_active_tx(),
             Transaction.date >= d_from,
             Transaction.date < d_to,
         )
@@ -163,7 +159,6 @@ def get_dashboard_activity(
 
     buckets = [ActivityBucketOut(date=d, count=c) for (d, c) in rows]
     return DashboardActivityOut(period=period, buckets=buckets)
-
 
 # ------------------ /dashboard/top-categories ------------------
 
@@ -183,7 +178,6 @@ def get_top_categories(
     if not group_ids:
         return TopCategoriesOut(period=period, items=[], total=0)
 
-    # Локали по приоритету: user.locale -> Accept-Language -> дефолты
     locales: list[str] = []
     user_locale = getattr(current_user, "locale", None)
     if user_locale:
@@ -192,7 +186,6 @@ def get_top_categories(
     for fb in ("en", "ru", "es"):
         if fb not in locales:
             locales.append(fb)
-    # уникализация с сохранением порядка
     seen: set[str] = set()
     locales = [x for x in locales if not (x in seen or seen.add(x))]
     if not locales:
@@ -200,7 +193,7 @@ def get_top_categories(
 
     where_clause = [
         Transaction.group_id.in_(group_ids),
-        Transaction.is_deleted.is_(False),
+        _is_active_tx(),
         Transaction.type == "expense",
         Transaction.date >= d_from,
         Transaction.date < d_to,
@@ -208,7 +201,6 @@ def get_top_categories(
     if currency:
         where_clause.append(Transaction.currency_code == currency)
 
-    # COALESCE(name_i18n['xx']::text, ..., key) AS name
     name_candidates = [ExpenseCategory.name_i18n[loc].astext for loc in locales]
     cat_name_expr = func.coalesce(*name_candidates, ExpenseCategory.key).label("name")
 
@@ -217,7 +209,7 @@ def get_top_categories(
     base = (
         select(
             Transaction.category_id.label("category_id"),
-            cat_name_expr,  # важно — тот же expr в GROUP BY
+            cat_name_expr,
             Transaction.currency_code.label("currency"),
             sum_amount,
         )
@@ -245,7 +237,6 @@ def get_top_categories(
     ]
     return TopCategoriesOut(period=period, items=items, total=int(total))
 
-
 # ------------------ /dashboard/summary ------------------
 
 @router.get("/summary", response_model=DashboardSummaryOut)
@@ -261,25 +252,24 @@ def get_dashboard_summary(
     if not group_ids:
         return DashboardSummaryOut(period=period, currency=currency, spent="0.00", avg_check="0.00", my_share="0.00")
 
-    rows = db.execute(
+    spent_sum, avg_check = db.execute(
         select(func.sum(Transaction.amount), func.avg(Transaction.amount))
         .where(
             Transaction.group_id.in_(group_ids),
-            Transaction.is_deleted.is_(False),
+            _is_active_tx(),
             Transaction.type == "expense",
             Transaction.currency_code == currency,
             Transaction.date >= d_from,
             Transaction.date < d_to,
         )
-    ).one()
-    spent_sum, avg_check = rows or (0, 0)
+    ).one() or (0, 0)
 
     my_share_sum = db.execute(
         select(func.sum(TransactionShare.amount))
         .join(Transaction, Transaction.id == TransactionShare.transaction_id)
         .where(
             Transaction.group_id.in_(group_ids),
-            Transaction.is_deleted.is_(False),
+            _is_active_tx(),
             Transaction.type == "expense",
             Transaction.currency_code == currency,
             Transaction.date >= d_from,
@@ -295,7 +285,6 @@ def get_dashboard_summary(
         avg_check=f"{avg_check or 0:.2f}",
         my_share=f"{my_share_sum or 0:.2f}",
     )
-
 
 # ------------------ /dashboard/recent-groups ------------------
 
@@ -314,9 +303,8 @@ def get_recent_groups(
             Group.deleted_at.is_(None),
             Group.status == GroupStatus.active,
         )
-        # ВАЖНО: правильный синтаксис NULLS LAST для Postgres
         .order_by(
-            nulls_last(Group.last_event_at.desc()),
+            Group.last_event_at.desc().nullslast(),
             Group.id.desc(),
         )
         .limit(limit)
@@ -329,7 +317,7 @@ def get_recent_groups(
             .join(Transaction, Transaction.id == TransactionShare.transaction_id)
             .where(
                 Transaction.group_id == g.id,
-                Transaction.is_deleted.is_(False),
+                _is_active_tx(),
                 TransactionShare.user_id == current_user.id,
             )
             .group_by(Transaction.currency_code)
@@ -345,7 +333,6 @@ def get_recent_groups(
             )
         )
     return out
-
 
 # ------------------ /dashboard/top-partners ------------------
 
@@ -367,7 +354,7 @@ def get_top_partners(
         .join(Transaction, Transaction.id == TransactionShare.transaction_id)
         .where(
             Transaction.group_id.in_(group_ids),
-            Transaction.is_deleted.is_(False),
+            _is_active_tx(),
             Transaction.type == "expense",
             Transaction.date >= d_from,
             Transaction.date < d_to,
@@ -394,7 +381,6 @@ def get_top_partners(
         for user, cnt in rows
     ]
 
-
 # ------------------ /dashboard/last-currencies ------------------
 
 @router.get("/last-currencies", response_model=list[str])
@@ -405,7 +391,6 @@ def get_last_currencies(
 ):
     return pick_last_currencies_for_user(db, current_user.id, limit=limit)
 
-
 # ------------------ /dashboard/events (UI-friendly feed) ------------------
 
 @router.get("/events", response_model=EventsFeedOut)
@@ -414,9 +399,6 @@ def get_ui_events_feed(
     db: Session = Depends(get_db),
     current_user=Depends(get_current_telegram_user),
 ):
-    """
-    UI-friendly лента событий (для фронта): возвращает готовые карточки.
-    """
     rows = db.execute(
         select(Event)
         .where(
