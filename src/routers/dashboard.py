@@ -2,7 +2,8 @@
 from __future__ import annotations
 
 from datetime import date, timedelta
-from typing import Literal, Optional, Sequence
+from decimal import Decimal, ROUND_HALF_UP
+from typing import Literal, Optional, Sequence, Dict, List
 
 from fastapi import APIRouter, Depends, Query, Request
 from sqlalchemy import and_, desc, func, or_, select
@@ -30,11 +31,20 @@ from src.schemas.dashboard import (
     EventFeedItemOut,
 )
 
-from src.utils.groups import pick_last_currencies_for_user
+# --- единые утилиты и математика из проекта ---
+from src.utils.groups import (
+    get_group_member_ids,
+    load_group_transactions,
+    pick_last_currencies_for_user,
+)
+from src.utils.balance import calculate_group_balances_by_currency
+
 
 router = APIRouter()
 
-# ------------------ helpers ------------------
+# =========================
+# Вспомогательные штуки
+# =========================
 
 def _period_to_range(today: date, period: Literal["day", "week", "month", "year"]) -> tuple[date, date]:
     if period == "day":
@@ -63,76 +73,126 @@ def _active_group_ids_for_user(db: Session, user_id: int) -> list[int]:
     return [gid for (gid,) in rows]
 
 
-def _parse_accept_language(header: str | None) -> list[str]:
-    if not header:
-        return []
-    parts: list[tuple[str, float]] = []
-    for chunk in header.split(","):
-        item = chunk.strip()
-        if not item:
-            continue
-        lang, *qpart = item.split(";")
-        base = lang.strip().lower().split("-")[0]
-        q = 1.0
-        if qpart:
-            try:
-                q = float(qpart[0].split("=")[1])
-            except Exception:
-                pass
-        parts.append((base, q))
-    seen: set[str] = set()
-    out: list[str] = []
-    for base, _q in sorted(parts, key=lambda x: x[1], reverse=True):
-        if base not in seen:
-            seen.add(base)
-            out.append(base)
-    return out
-
-# Удобная «маска» для активных транзакций с учётом исторических NULL
+# исторические NULL считаем «не удалено» — как на вкладке баланса
 def _is_active_tx():
     return or_(Transaction.is_deleted.is_(False), Transaction.is_deleted.is_(None))
 
-# ------------------ /dashboard/balance ------------------
 
+# Валютные деноминации (для округления и eps)
+_DECIMALS: Dict[str, int] = {
+    # без копеек
+    "JPY": 0, "KRW": 0, "HUF": 0, "VND": 0, "CLP": 0, "ISK": 0,
+    # три знака
+    "BHD": 3, "IQD": 3, "JOD": 3, "KWD": 3, "LYD": 3, "OMR": 3, "TND": 3,
+    # экзотика
+    "CLF": 4,
+}
+DEF_DECIMALS = 2
+
+def _decimals_for(ccy: str) -> int:
+    return int(_DECIMALS.get((ccy or "").upper(), DEF_DECIMALS))
+
+def _q(decimals: int) -> Decimal:
+    return Decimal("1") if decimals <= 0 else Decimal("1").scaleb(-decimals)
+
+def _round(d: Decimal, decimals: int) -> Decimal:
+    return d.quantize(_q(decimals), rounding=ROUND_HALF_UP)
+
+def _eps_for(decimals: int) -> Decimal:
+    # минимально — 1e-2 как в utils.balance._eps
+    return Decimal("1").scaleb(-max(decimals, 2))
+
+def _D(x) -> Decimal:
+    if isinstance(x, Decimal):
+        return x
+    return Decimal(str(x))
+
+
+# =========================
+# /dashboard/balance  — ВАРИАНТ A
+# =========================
 @router.get("/balance", response_model=DashboardBalanceOut)
 def get_dashboard_balance(
-    currencies: Optional[Sequence[str]] = Query(None),
     db: Session = Depends(get_db),
     current_user=Depends(get_current_telegram_user),
 ):
-    group_ids = _active_group_ids_for_user(db, current_user.id)
+    """
+    Глобальный баланс пользователя по ВСЕМ активным группам:
+    • считаем net по каждой группе той же математикой, что и вкладка «Баланс»;
+    • суммируем net пользователя по валютам;
+      net>0 → they_owe_me[ccy] += net
+      net<0 → i_owe[ccy]      += -net
+    • округляем по деноминации, режем «пыль» (eps), коды валют — UPPERCASE.
+    """
+    user_id = int(current_user.id)
+    group_ids = _active_group_ids_for_user(db, user_id)
     if not group_ids:
         return DashboardBalanceOut(i_owe={}, they_owe_me={}, last_currencies=[])
 
-    q = (
-        select(Transaction.currency_code, func.sum(TransactionShare.amount))
-        .select_from(TransactionShare)
-        .join(Transaction, Transaction.id == TransactionShare.transaction_id)
-        .where(
-            Transaction.group_id.in_(group_ids),
-            _is_active_tx(),
-            TransactionShare.user_id == current_user.id,
-        )
-        .group_by(Transaction.currency_code)
+    they_owe_me_acc: Dict[str, Decimal] = {}
+    i_owe_acc: Dict[str, Decimal] = {}
+
+    for gid in group_ids:
+        # активные участники в группе
+        member_ids = get_group_member_ids(db, gid)
+        if not member_ids or user_id not in member_ids:
+            continue
+
+        # только не удалённые транзакции + shares (как в группе)
+        txs = load_group_transactions(db, gid)
+        if not txs:
+            continue
+
+        nets_by_ccy = calculate_group_balances_by_currency(txs, member_ids)
+        for code, per_user in nets_by_ccy.items():
+            ccy = (code or "").upper() or "XXX"
+            net = _D(per_user.get(user_id, Decimal("0")))
+            if not net:
+                continue
+
+            decs = _decimals_for(ccy)
+            eps = _eps_for(decs)
+
+            if net > eps:
+                # мне должны
+                they_owe_me_acc[ccy] = they_owe_me_acc.get(ccy, Decimal("0")) + net
+            elif net < -eps:
+                # я должен (храним в аккумуляторе положительным числом — модуль)
+                i_owe_acc[ccy] = i_owe_acc.get(ccy, Decimal("0")) + (-net)
+
+    # Округление и отбрасывание «пыли»
+    they_owe_me_str: Dict[str, str] = {}
+    for ccy, amt in they_owe_me_acc.items():
+        decs = _decimals_for(ccy)
+        eps = _eps_for(decs)
+        v = _round(amt, decs)
+        if v.copy_abs() > eps:
+            # по примеру из твоей схемы оставляю «+»
+            sign = "+" if v >= 0 else "-"
+            they_owe_me_str[ccy] = f"{sign}{abs(v):.{decs}f}"
+
+    i_owe_str: Dict[str, str] = {}
+    for ccy, amt in i_owe_acc.items():
+        decs = _decimals_for(ccy)
+        eps = _eps_for(decs)
+        v = _round(amt, decs)
+        if v.copy_abs() > eps:
+            # здесь всегда должен быть минус — это «я должен»
+            i_owe_str[ccy] = f"-{abs(v):.{decs}f}"
+
+    # Последние валюты пользователя (как у тебя в utils)
+    last_currencies = pick_last_currencies_for_user(db, user_id, limit=2)
+
+    return DashboardBalanceOut(
+        i_owe=i_owe_str,
+        they_owe_me=they_owe_me_str,
+        last_currencies=[(c or "").upper() for c in last_currencies],
     )
-    if currencies:
-        q = q.where(Transaction.currency_code.in_(currencies))
 
-    rows = db.execute(q).all()
-    i_owe: dict[str, str] = {}
-    they_owe_me: dict[str, str] = {}
-    for ccy, s in rows:
-        s = s or 0
-        if s >= 0:
-            they_owe_me[ccy] = f"{s:.2f}"
-        else:
-            i_owe[ccy] = f"{s:.2f}"
 
-    last_currencies = pick_last_currencies_for_user(db, current_user.id, limit=2)
-    return DashboardBalanceOut(i_owe=i_owe, they_owe_me=they_owe_me, last_currencies=last_currencies)
-
-# ------------------ /dashboard/activity ------------------
-
+# =========================
+# /dashboard/activity
+# =========================
 @router.get("/activity", response_model=DashboardActivityOut)
 def get_dashboard_activity(
     period: Literal["day", "week", "month", "year"] = Query("month"),
@@ -160,7 +220,34 @@ def get_dashboard_activity(
     buckets = [ActivityBucketOut(date=d, count=c) for (d, c) in rows]
     return DashboardActivityOut(period=period, buckets=buckets)
 
-# ------------------ /dashboard/top-categories ------------------
+
+# =========================
+# /dashboard/top-categories
+# =========================
+def _parse_accept_language(header: str | None) -> list[str]:
+    if not header:
+        return []
+    parts: list[tuple[str, float]] = []
+    for chunk in header.split(","):
+        item = chunk.strip()
+        if not item:
+            continue
+        lang, *qpart = item.split(";")
+        base = lang.strip().lower().split("-")[0]
+        q = 1.0
+        if qpart:
+            try:
+                q = float(qpart[0].split("=")[1])
+            except Exception:
+                pass
+        parts.append((base, q))
+    seen: set[str] = set()
+    out: list[str] = []
+    for base, _q in sorted(parts, key=lambda x: x[1], reverse=True):
+        if base not in seen:
+            seen.add(base)
+            out.append(base)
+    return out
 
 @router.get("/top-categories", response_model=TopCategoriesOut)
 def get_top_categories(
@@ -237,8 +324,10 @@ def get_top_categories(
     ]
     return TopCategoriesOut(period=period, items=items, total=int(total))
 
-# ------------------ /dashboard/summary ------------------
 
+# =========================
+# /dashboard/summary
+# =========================
 @router.get("/summary", response_model=DashboardSummaryOut)
 def get_dashboard_summary(
     period: Literal["day", "week", "month", "year"] = Query("month"),
@@ -286,8 +375,10 @@ def get_dashboard_summary(
         my_share=f"{my_share_sum or 0:.2f}",
     )
 
-# ------------------ /dashboard/recent-groups ------------------
 
+# =========================
+# /dashboard/recent-groups
+# =========================
 @router.get("/recent-groups", response_model=list[RecentGroupCardOut])
 def get_recent_groups(
     limit: int = Query(10, ge=1, le=100),
@@ -322,7 +413,7 @@ def get_recent_groups(
             )
             .group_by(Transaction.currency_code)
         ).all()
-        my_balance = {ccy: f"{s or 0:.2f}" for (ccy, s) in sums}
+        my_balance = { (ccy or "").upper(): f"{(s or 0):.2f}" for (ccy, s) in sums }
         out.append(
             RecentGroupCardOut(
                 id=g.id,
@@ -334,8 +425,10 @@ def get_recent_groups(
         )
     return out
 
-# ------------------ /dashboard/top-partners ------------------
 
+# =========================
+# /dashboard/top-partners
+# =========================
 @router.get("/top-partners", response_model=list[TopPartnerItemOut])
 def get_top_partners(
     period: Literal["week", "month", "year"] = Query("month"),
@@ -381,18 +474,22 @@ def get_top_partners(
         for user, cnt in rows
     ]
 
-# ------------------ /dashboard/last-currencies ------------------
 
+# =========================
+# /dashboard/last-currencies
+# =========================
 @router.get("/last-currencies", response_model=list[str])
 def get_last_currencies(
     limit: int = Query(2, ge=1, le=10),
     db: Session = Depends(get_db),
     current_user=Depends(get_current_telegram_user),
 ):
-    return pick_last_currencies_for_user(db, current_user.id, limit=limit)
+    return [ (c or "").upper() for c in pick_last_currencies_for_user(db, current_user.id, limit=limit) ]
 
-# ------------------ /dashboard/events (UI-friendly feed) ------------------
 
+# =========================
+# /dashboard/events — UI-friendly
+# =========================
 @router.get("/events", response_model=EventsFeedOut)
 def get_ui_events_feed(
     limit: int = Query(20, ge=1, le=100),
