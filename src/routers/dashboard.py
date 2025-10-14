@@ -210,6 +210,7 @@ def get_dashboard_activity(
         .where(
             Transaction.group_id.in_(group_ids),
             _is_active_tx(),
+            Transaction.type == "expense",
             Transaction.date >= d_from,
             Transaction.date < d_to,
         )
