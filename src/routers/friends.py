@@ -84,8 +84,8 @@ def _build_friend_out_list(
         result.append(
             FriendOut(
                 id=link.id,
-                user_id=other.id,
-                friend_id=owner.id,
+                user_id=owner.id,           # Владелец списка (Я)
+                friend_id=other.id,         # Друг
                 created_at=link.created_at,
                 updated_at=link.updated_at,
                 hidden=_hidden_for_viewer(link, owner.id),
@@ -179,14 +179,12 @@ def accept_invite(
         db.commit()
     else:
         # Уже дружим: снимем скрытие для обоих (на случай, если кто-то скрывал ранее)
-        changed = False
         if link.hidden_by_min or link.hidden_by_max:
             link.hidden_by_min = False
             link.hidden_by_max = False
             link.hidden = False  # legacy: ведём как "не скрыт"
             link.updated_at = now
             db.commit()
-            changed = True
         # События о повторном принятии инвайта не пишем, чтобы не спамить.
 
     # Учёт использования инвайта (как было)
@@ -310,8 +308,8 @@ def search_friends(
     )
 
     # Сопоставим user_id -> link, чтобы получить hidden и даты
-    links_map = { _other_id(l, current_user.id): l for l in links }
-    profiles_map = { u.id: u for u in users }
+    links_map = {_other_id(l, current_user.id): l for l in links}
+    profiles_map = {u.id: u for u in users}
 
     result = []
     for uid, profile in profiles_map.items():
@@ -321,8 +319,8 @@ def search_friends(
         result.append(
             FriendOut(
                 id=link.id,
-                user_id=uid,
-                friend_id=current_user.id,
+                user_id=current_user.id,       # Я — владелец списка
+                friend_id=uid,                 # Найденный друг
                 created_at=link.created_at,
                 updated_at=link.updated_at,
                 hidden=_hidden_for_viewer(link, current_user.id),
@@ -353,8 +351,8 @@ def get_friend_detail(
 
     return FriendOut(
         id=link.id,
-        user_id=friend_id,
-        friend_id=current_user.id,
+        user_id=current_user.id,      # Я
+        friend_id=friend_id,          # Друг
         created_at=link.created_at,
         updated_at=link.updated_at,
         hidden=_hidden_for_viewer(link, current_user.id),
@@ -406,7 +404,7 @@ def get_friends_of_user(
         .all()
     )
 
-    ids = { _other_id(l, user_id) for l in links } | { user_id }
+    ids = {_other_id(l, user_id) for l in links} | {user_id}
     profiles = db.query(User).filter(User.id.in_(ids)).all() if ids else []
     profiles_map = {u.id: u for u in profiles}
     owner = profiles_map.get(user_id)
@@ -419,8 +417,8 @@ def get_friends_of_user(
         result.append(
             FriendOut(
                 id=link.id,
-                user_id=contact.id,
-                friend_id=user_id,
+                user_id=owner.id,         # Владелец списка
+                friend_id=contact.id,     # Его друг
                 created_at=link.created_at,
                 updated_at=link.updated_at,
                 hidden=_hidden_for_viewer(link, user_id),
