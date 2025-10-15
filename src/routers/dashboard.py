@@ -1,3 +1,4 @@
+# src/routers/dashboard.py
 from __future__ import annotations
 
 from datetime import date, timedelta
@@ -6,7 +7,7 @@ from typing import Literal, Optional, Sequence, Dict, List
 
 from fastapi import APIRouter, Depends, Query, Request
 from sqlalchemy import and_, desc, func, or_, select
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, aliased  # ← добавили aliased
 
 from src.db import get_db
 from src.utils.telegram_dep import get_current_telegram_user
@@ -116,12 +117,7 @@ def get_dashboard_balance(
     current_user=Depends(get_current_telegram_user),
 ):
     """
-    Глобальный баланс пользователя по ВСЕМ активным группам:
-    • считаем net по каждой группе той же математикой, что и вкладка «Баланс»;
-    • суммируем net пользователя по валютам;
-      net>0 → they_owe_me[ccy] += net
-      net<0 → i_owe[ccy]      += -net
-    • округляем по деноминации, режем «пыль» (eps), коды валют — UPPERCASE.
+    Глобальный баланс пользователя по ВСЕМ активным группам...
     """
     user_id = int(current_user.id)
     group_ids = _active_group_ids_for_user(db, user_id)
@@ -132,12 +128,10 @@ def get_dashboard_balance(
     i_owe_acc: Dict[str, Decimal] = {}
 
     for gid in group_ids:
-        # активные участники в группе
         member_ids = get_group_member_ids(db, gid)
         if not member_ids or user_id not in member_ids:
             continue
 
-        # только не удалённые транзакции + shares (как в группе)
         txs = load_group_transactions(db, gid)
         if not txs:
             continue
@@ -153,20 +147,16 @@ def get_dashboard_balance(
             eps = _eps_for(decs)
 
             if net > eps:
-                # мне должны
                 they_owe_me_acc[ccy] = they_owe_me_acc.get(ccy, Decimal("0")) + net
             elif net < -eps:
-                # я должен (храним в аккумуляторе положительным числом — модуль)
                 i_owe_acc[ccy] = i_owe_acc.get(ccy, Decimal("0")) + (-net)
 
-    # Округление и отбрасывание «пыли»
     they_owe_me_str: Dict[str, str] = {}
     for ccy, amt in they_owe_me_acc.items():
         decs = _decimals_for(ccy)
         eps = _eps_for(decs)
         v = _round(amt, decs)
         if v.copy_abs() > eps:
-            # по примеру из твоей схемы оставляю «+»
             sign = "+" if v >= 0 else "-"
             they_owe_me_str[ccy] = f"{sign}{abs(v):.{decs}f}"
 
@@ -176,10 +166,8 @@ def get_dashboard_balance(
         eps = _eps_for(decs)
         v = _round(amt, decs)
         if v.copy_abs() > eps:
-            # здесь всегда должен быть минус — это «я должен»
             i_owe_str[ccy] = f"-{abs(v):.{decs}f}"
 
-    # Последние валюты пользователя (как у тебя в utils)
     last_currencies = pick_last_currencies_for_user(db, user_id, limit=2)
 
     return DashboardBalanceOut(
@@ -256,8 +244,8 @@ def get_top_categories(
     currency: Optional[str] = Query(None),
     limit: int = Query(50, ge=1, le=500),
     offset: int = Query(0, ge=0),
-    # НОВОЕ: явная локаль из клиента имеет наивысший приоритет
-    locale: Optional[str] = Query(None, description="UI locale (ru/en/es) — приоритетнее профиля и Accept-Language"),
+    # НОВОЕ: принимать locale из клиента и ставить его ПЕРВЫМ приоритетом
+    locale: Optional[str] = Query(None, description="UI locale, e.g. ru/en/es"),  # ← добавлено
     db: Session = Depends(get_db),
     current_user=Depends(get_current_telegram_user),
 ):
@@ -267,14 +255,17 @@ def get_top_categories(
     if not group_ids:
         return TopCategoriesOut(period=period, items=[], total=0)
 
-    # ПРИОРИТЕТЫ ЛОКАЛИ: ?locale → профиль пользователя → Accept-Language → en/ru/es
     locales: list[str] = []
+    # 1) Язык из query ?locale=, если пришёл
     if locale:
         locales.append(str(locale).split("-")[0].lower())
+    # 2) Язык пользователя
     user_locale = getattr(current_user, "locale", None)
     if user_locale:
         locales.append(str(user_locale).split("-")[0].lower())
+    # 3) Accept-Language
     locales += _parse_accept_language(request.headers.get("Accept-Language"))
+    # 4) Фолбэки
     for fb in ("en", "ru", "es"):
         if fb not in locales:
             locales.append(fb)
@@ -293,11 +284,14 @@ def get_top_categories(
     if currency:
         where_clause.append(Transaction.currency_code == currency)
 
-    # локализованное имя категории по приоритету локалей
+    # локализуем имя через coalesce(name_i18n[loc]...)
     name_candidates = [ExpenseCategory.name_i18n[loc].astext for loc in locales]
     cat_name_expr = func.coalesce(*name_candidates, ExpenseCategory.key).label("name")
 
     sum_amount = func.sum(Transaction.amount).label("sum_amount")
+
+    # self-join на родителя, чтобы использовать его цвет как фолбэк
+    Parent = aliased(ExpenseCategory)
 
     base = (
         select(
@@ -305,13 +299,20 @@ def get_top_categories(
             cat_name_expr,
             Transaction.currency_code.label("currency"),
             sum_amount,
+            ExpenseCategory.icon.label("icon"),
+            ExpenseCategory.color.label("color"),
+            Parent.color.label("parent_color"),
         )
         .join(ExpenseCategory, ExpenseCategory.id == Transaction.category_id)
+        .join(Parent, Parent.id == ExpenseCategory.parent_id, isouter=True)
         .where(and_(*where_clause))
         .group_by(
             Transaction.category_id,
             cat_name_expr,
             Transaction.currency_code,
+            ExpenseCategory.icon,
+            ExpenseCategory.color,
+            Parent.color,
         )
         .order_by(desc(sum_amount))
     )
@@ -325,6 +326,8 @@ def get_top_categories(
             name=row.name,
             sum=f"{(row.sum_amount or 0):.2f}",
             currency=row.currency,
+            icon=row.icon,
+            color=row.color or row.parent_color,  # цвет ребёнка, иначе родителя
         )
         for row in rows
     ]
