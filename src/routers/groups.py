@@ -41,6 +41,17 @@ from src.utils.media import (
     delete_if_local,
 )
 
+# >>> НОВОЕ: логирование событий
+from src.services.events import (
+    log_event,
+    GROUP_CREATED,
+    GROUP_RENAMED,
+    GROUP_AVATAR_CHANGED,
+    GROUP_DELETED,
+    GROUP_ARCHIVED,
+    GROUP_UNARCHIVED,
+)
+
 router = APIRouter()
 
 # ===== Вспомогательные =======================================================
@@ -240,7 +251,8 @@ def get_group_settle_up(
     if algo == "pairs":
         debts_by_ccy = build_debts_matrix_by_currency(transactions, member_ids)
         d = int(decimals_map.get(code, 2))
-        matrix = debts_by_ccy.get(code, {})
+        matrix = debts_by_ccy.get(code, {}
+        )
         return pairwise_settle_up_single_currency(matrix, d, currency_code=code)
 
     # greedy
@@ -262,8 +274,22 @@ def create_group(group: GroupCreate, db: Session = Depends(get_db)):
         settle_algorithm=SettleAlgorithm(incoming.lower().strip()),
     )
     db.add(db_group)
+    # Чтобы получить id группы до коммита — и записать событие в ту же транзакцию:
+    db.flush()
+
+    # Лог события создания (actor = владелец; если хочешь — можно позже переделать на current_user)
+    log_event(
+        db,
+        type=GROUP_CREATED,
+        actor_id=db_group.owner_id,
+        group_id=db_group.id,
+        data={"group_id": db_group.id, "group_name": db_group.name, "creator_id": db_group.owner_id},
+    )
+
     db.commit()
     db.refresh(db_group)
+
+    # Владелец становится участником (как и было)
     add_member_to_group(db, db_group.id, db_group.owner_id)
     return db_group
 
@@ -538,6 +564,16 @@ def archive_group(
 
     group.status = GroupStatus.archived
     group.archived_at = datetime.utcnow()
+
+    # лог события архивации
+    log_event(
+        db,
+        type=GROUP_ARCHIVED,
+        actor_id=current_user.id,
+        group_id=group.id,
+        data={"group_id": group.id},
+    )
+
     db.commit()
 
 
@@ -553,8 +589,19 @@ def unarchive_group(
         if return_full:
             return GroupOut.from_orm(group)
         return Response(status_code=status.HTTP_204_NO_CONTENT)
+
     group.status = GroupStatus.active
     group.archived_at = None
+
+    # лог события разархивации
+    log_event(
+        db,
+        type=GROUP_UNARCHIVED,
+        actor_id=current_user.id,
+        group_id=group.id,
+        data={"group_id": group.id},
+    )
+
     db.commit()
     if return_full:
         db.refresh(group)
@@ -588,6 +635,15 @@ def soft_delete_group(
     if not has_tx and group.deleted_at is None:
         if has_debts_flag:
             raise HTTPException(status_code=409, detail="В группе есть непогашенные долги")
+
+        # Логируем hard-удаление и удаляем
+        log_event(
+            db,
+            type=GROUP_DELETED,
+            actor_id=current_user.id,
+            group_id=group.id,
+            data={"group_id": group.id, "mode": "hard"},
+        )
         _hard_delete_group_impl(db, group_id)
         return
 
@@ -597,6 +653,16 @@ def soft_delete_group(
 
     if group.deleted_at is None:
         group.deleted_at = datetime.utcnow()
+
+        # Логируем soft-удаление
+        log_event(
+            db,
+            type=GROUP_DELETED,
+            actor_id=current_user.id,
+            group_id=group.id,
+            data={"group_id": group.id, "mode": "soft"},
+        )
+
         db.commit()
     else:
         # уже soft — ничего не делаем
@@ -695,6 +761,15 @@ def hard_delete_group(
     if has_group_debts(db, group_id):
         raise HTTPException(status_code=409, detail="В группе есть непогашенные долги")
 
+    # Логируем hard-удаление до удаления сущности (сольётся в один commit)
+    log_event(
+        db,
+        type=GROUP_DELETED,
+        actor_id=current_user.id,
+        group_id=group.id,
+        data={"group_id": group.id, "mode": "hard"},
+    )
+
     _hard_delete_group_impl(db, group_id)
 
 # ===== Смена валюты группы ====================================================
@@ -783,6 +858,16 @@ def set_group_avatar_by_url(
     group.avatar_url = str(absolute_url)
     group.avatar_file_id = None
     group.avatar_updated_at = datetime.utcnow()
+
+    # лог смены аватара (old -> new)
+    log_event(
+        db,
+        type=GROUP_AVATAR_CHANGED,
+        actor_id=current_user.id,
+        group_id=group.id,
+        data={"group_id": group.id, "old_avatar_url": old_url, "new_avatar_url": group.avatar_url},
+    )
+
     db.commit()
     db.refresh(group)
 
@@ -817,6 +902,16 @@ def delete_group_avatar(
     group.avatar_url = None
     group.avatar_file_id = None
     group.avatar_updated_at = datetime.utcnow()
+
+    # лог "смены" аватара на None
+    log_event(
+        db,
+        type=GROUP_AVATAR_CHANGED,
+        actor_id=current_user.id,
+        group_id=group.id,
+        data={"group_id": group.id, "old_avatar_url": old_url, "new_avatar_url": None},
+    )
+
     db.commit()
 
     # пытаемся удалить локальный файл (если он из нашего /media/group_avatars)
@@ -825,8 +920,8 @@ def delete_group_avatar(
 # ===== Расписание (end_date / auto_archive) ===================================
 
 class GroupScheduleUpdate(BaseModel):
-  end_date: Optional[date] = None
-  auto_archive: Optional[bool] = None
+    end_date: Optional[date] = None
+    auto_archive: Optional[bool] = None
 
 @router.patch("/{group_id}/schedule", response_model=GroupOut)
 def update_group_schedule(
@@ -862,8 +957,8 @@ def update_group_schedule(
     return group
 
 class GroupUpdate(BaseModel):
-  name: Optional[constr(strip_whitespace=True, min_length=1, max_length=120)] = None
-  description: Optional[constr(strip_whitespace=True, max_length=500)] = None
+    name: Optional[constr(strip_whitespace=True, min_length=1, max_length=120)] = None
+    description: Optional[constr(strip_whitespace=True, max_length=500)] = None
 
 @router.patch("/{group_id}", response_model=GroupOut)
 def update_group_info(
@@ -881,6 +976,7 @@ def update_group_info(
     ensure_group_active(group)
 
     fields_set = getattr(payload, "__fields_set__", getattr(payload, "model_fields_set", set()))
+    old_name = group.name  # для возможного лога переименования
 
     if "name" in fields_set and payload.name is not None:
         group.name = payload.name
@@ -888,6 +984,16 @@ def update_group_info(
     if "description" in fields_set:
         desc = payload.description
         group.description = (desc if desc is not None and desc != "" else None)
+
+    # Если имя изменилось — запишем событие
+    if old_name is not None and group.name is not None and old_name != group.name:
+        log_event(
+            db,
+            type=GROUP_RENAMED,
+            actor_id=current_user.id,
+            group_id=group.id,
+            data={"group_id": group.id, "old_name": old_name, "new_name": group.name},
+        )
 
     db.commit()
     db.refresh(group)

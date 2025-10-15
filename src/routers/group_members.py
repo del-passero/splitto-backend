@@ -33,6 +33,14 @@ from src.utils.groups import (
 )
 from src.utils.balance import calculate_group_balances_by_currency
 
+# === Логирование событий ===
+from src.services.events import (
+    log_event,
+    MEMBER_ADDED,
+    MEMBER_REMOVED,
+    MEMBER_LEFT,
+)
+
 router = APIRouter()
 
 
@@ -40,9 +48,14 @@ def _err(code: str, message: str) -> Dict[str, str]:
     return {"code": code, "message": message}
 
 
+def _pair_min_max(a: int, b: int) -> (int, int):
+    return (a, b) if a < b else (b, a)
+
+
 def add_mutual_friends_for_group(db: Session, group_id: int):
     """
-    Bulk-добавление дружбы между ВСЕМИ активными участниками (deleted_at IS NULL).
+    Bulk-добавление дружбы между ВСЕМИ активными участниками (deleted_at IS NULL)
+    под каноническую модель дружбы: одна строка на пару (user_min, user_max).
     """
     member_ids = [
         m[0]
@@ -50,23 +63,28 @@ def add_mutual_friends_for_group(db: Session, group_id: int):
         .filter(GroupMember.group_id == group_id, GroupMember.deleted_at.is_(None))
         .all()
     ]
-    if not member_ids:
+    if not member_ids or len(member_ids) < 2:
         return
 
-    existing_links = db.query(Friend.user_id, Friend.friend_id).filter(
-        Friend.user_id.in_(member_ids),
-        Friend.friend_id.in_(member_ids),
-    ).all()
-    existing_set = set(existing_links)
+    # Уже существующие канонические пары
+    existing_pairs = {
+        (umin, umax)
+        for (umin, umax) in db.query(Friend.user_min, Friend.user_max)
+        .filter(
+            Friend.user_min.in_(member_ids),
+            Friend.user_max.in_(member_ids),
+        )
+        .all()
+    }
 
-    to_create = []
+    to_create: List[Friend] = []
+    # Пройдемся по всем комбинациям (i < j), создадим недостающие пары
     for i in range(len(member_ids)):
         for j in range(i + 1, len(member_ids)):
-            a, b = member_ids[i], member_ids[j]
-            if (a, b) not in existing_set:
-                to_create.append(Friend(user_id=a, friend_id=b))
-            if (b, a) not in existing_set:
-                to_create.append(Friend(user_id=b, friend_id=a))
+            u1, u2 = member_ids[i], member_ids[j]
+            umin, umax = _pair_min_max(u1, u2)
+            if (umin, umax) not in existing_pairs:
+                to_create.append(Friend(user_min=umin, user_max=umax, hidden_by_min=False, hidden_by_max=False))
 
     if to_create:
         db.bulk_save_objects(to_create)
@@ -112,7 +130,7 @@ def _ensure_member_zero_balances_or_409(db: Session, group_id: int, user_id: int
 def add_group_member(
     member: GroupMemberCreate,
     db: Session = Depends(get_db),
-    current_user=Depends(get_current_telegram_user),
+    current_user: User = Depends(get_current_telegram_user),
 ):
     """
     Добавить участника:
@@ -131,19 +149,44 @@ def add_group_member(
         GroupMember.user_id == member.user_id,
     ).first()
 
-    if existing and existing.deleted_at is None:
-        raise HTTPException(status_code=400, detail=_err("already_member", "Пользователь уже в группе"))
-
+    # Реактивация soft-deleted
     if existing and existing.deleted_at is not None:
         existing.deleted_at = None
         db.add(existing)
+
+        # ЛОГ: участник добавлен (реактивация как админ-добавление)
+        log_event(
+            db,
+            type=MEMBER_ADDED,
+            actor_id=current_user.id,
+            group_id=member.group_id,
+            target_user_id=member.user_id,
+            data={"member_id": member.user_id, "via": "admin_add", "reactivated": True},
+        )
+
         db.commit()
         db.refresh(existing)
         add_mutual_friends_for_group(db, member.group_id)
         return existing
 
+    # Уже активный — 400
+    if existing and existing.deleted_at is None:
+        raise HTTPException(status_code=400, detail=_err("already_member", "Пользователь уже в группе"))
+
+    # Новая запись
     db_member = GroupMember(group_id=member.group_id, user_id=member.user_id)
     db.add(db_member)
+
+    # ЛОГ: участник добавлен (через интерфейс участника — считаем как admin_add)
+    log_event(
+        db,
+        type=MEMBER_ADDED,
+        actor_id=current_user.id,
+        group_id=member.group_id,
+        target_user_id=member.user_id,
+        data={"member_id": member.user_id, "via": "admin_add"},
+    )
+
     db.commit()
     db.refresh(db_member)
     add_mutual_friends_for_group(db, member.group_id)
@@ -153,7 +196,7 @@ def add_group_member(
 @router.get("/", response_model=Union[List[GroupMemberOut], dict])
 def get_group_members(
     db: Session = Depends(get_db),
-    current_user=Depends(get_current_telegram_user),
+    current_user: User = Depends(get_current_telegram_user),
     offset: int = Query(0, ge=0),
     limit: Optional[int] = Query(None, gt=0),
 ):
@@ -175,7 +218,7 @@ def get_group_members(
 def get_members_for_group(
     group_id: int,
     db: Session = Depends(get_db),
-    current_user=Depends(get_current_telegram_user),
+    current_user: User = Depends(get_current_telegram_user),
     offset: int = Query(0, ge=0),
     limit: Optional[int] = Query(None, gt=0),
 ):
@@ -209,7 +252,7 @@ def get_members_for_group(
 def delete_group_member(
     member_id: int,
     db: Session = Depends(get_db),
-    current_user=Depends(get_current_telegram_user),
+    current_user: User = Depends(get_current_telegram_user),
 ):
     """
     Кик участника:
@@ -235,10 +278,20 @@ def delete_group_member(
     # мультивалютная проверка нулевого баланса
     _ensure_member_zero_balances_or_409(db, group.id, member.user_id)
 
-    # soft-delete
+    # soft-delete (и лог)
     if member.deleted_at is None:
         member.deleted_at = datetime.utcnow()
         db.add(member)
+
+        log_event(
+            db,
+            type=MEMBER_REMOVED,
+            actor_id=current_user.id,
+            group_id=group.id,
+            target_user_id=member.user_id,
+            data={"member_id": member.user_id, "by_admin_id": current_user.id},
+        )
+
         db.commit()
     return
 
@@ -247,7 +300,7 @@ def delete_group_member(
 def leave_group(
     group_id: int,
     db: Session = Depends(get_db),
-    current_user=Depends(get_current_telegram_user),
+    current_user: User = Depends(get_current_telegram_user),
 ):
     """
     Самовыход участника:
@@ -276,9 +329,19 @@ def leave_group(
     # мультивалютная проверка нулевого баланса
     _ensure_member_zero_balances_or_409(db, group.id, current_user.id)
 
-    # soft-delete
+    # soft-delete (и лог)
     if member.deleted_at is None:
         member.deleted_at = datetime.utcnow()
         db.add(member)
+
+        log_event(
+            db,
+            type=MEMBER_LEFT,
+            actor_id=current_user.id,
+            group_id=group.id,
+            target_user_id=current_user.id,
+            data={"member_id": current_user.id},
+        )
+
         db.commit()
     return

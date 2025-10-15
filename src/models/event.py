@@ -1,33 +1,39 @@
 # src/models/event.py
-
-from sqlalchemy import Column, Integer, String, DateTime, ForeignKey, func, JSON
-from sqlalchemy.orm import relationship
+from sqlalchemy import Column, Integer, String, DateTime, func, UniqueConstraint
+from sqlalchemy.dialects.postgresql import JSONB
 from src.db import Base
 
 class Event(Base):
-    """
-    ”ниверсальное событие дл¤ ленты активности (event feed).
-
-    ќсобенности:
-        - actor_id Ч инициатор (всегда кто-то из User).
-        - target_user_id, group_id Ч опционально (если событие св¤зано с другим пользователем или группой).
-        - type Ч строка-ключ событи¤ (например, 'friend_added', 'invite_registered', 'transaction_created').
-        - data Ч любые дополнительные параметры (сумма, имена, id, текст).
-        - created_at Ч врем¤ событи¤.
-    """
     __tablename__ = "events"
 
-    id = Column(Integer, primary_key=True)
-    actor_id = Column(Integer, ForeignKey("users.id"), nullable=False)
-    target_user_id = Column(Integer, ForeignKey("users.id"), nullable=True)
-    group_id = Column(Integer, ForeignKey("groups.id"), nullable=True)
-    type = Column(String, nullable=False)
-    data = Column(JSON, nullable=True)
-    created_at = Column(DateTime, nullable=False, default=func.now())
+    id = Column(Integer, primary_key=True, index=True)
 
-    actor = relationship("User", foreign_keys=[actor_id])
-    target_user = relationship("User", foreign_keys=[target_user_id])
-    # group Ч св¤зь с группой, если модель группы у теб¤ есть
+    # кто совершил действие
+    actor_id = Column(Integer, nullable=False)
 
-    def __repr__(self):
-        return f"<Event(type={self.type}, actor_id={self.actor_id}, target_user_id={self.target_user_id}, group_id={self.group_id})>"
+    # к какой группе относится (может быть NULL для персональных событий)
+    group_id = Column(Integer, nullable=True)
+
+    # над кем действие (например, дружба/удаление участника) — может быть NULL
+    target_user_id = Column(Integer, nullable=True)
+
+    # (НОВОЕ) связь с транзакцией, если событие о транзакции
+    transaction_id = Column(Integer, nullable=True)
+
+    # тип события
+    type = Column(String(64), nullable=False)
+
+    # произвольные данные события
+    data = Column(JSONB, nullable=True, default={})
+
+    created_at = Column(DateTime, nullable=False, server_default=func.now())
+
+    # (НОВОЕ) идемпотентный ключ, чтобы не записывать дубль при ретраях
+    idempotency_key = Column(String(64), nullable=True)
+
+    __table_args__ = (
+        UniqueConstraint("idempotency_key", name="uq_events_idempotency_key"),
+    )
+
+    def __repr__(self) -> str:
+        return f"<Event id={self.id} type={self.type} actor={self.actor_id} group={self.group_id}>"

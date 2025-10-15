@@ -6,6 +6,8 @@ from __future__ import annotations
 
 from decimal import Decimal, ROUND_HALF_UP
 from typing import List, Optional, Dict, Iterable, Set
+import hashlib
+import json
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response, Request
 from starlette import status
@@ -17,7 +19,7 @@ from src.models.transaction import Transaction
 from src.models.transaction_share import TransactionShare
 from src.models.currency import Currency
 from src.models.user import User
-from src.models.group import Group, GroupStatus
+from src.models.group import Group
 from src.models.group_member import GroupMember
 from src.schemas.transaction import TransactionCreate, TransactionUpdate, TransactionOut
 from src.schemas.user import UserOut
@@ -34,16 +36,27 @@ from src.utils.groups import (
 
 from pydantic import BaseModel, constr
 
-# === Новое: общие медиа-утилиты ===============================================
+# === Общие медиа-утилиты ======================================================
 from src.utils.media import (
     to_abs_media_url,
     url_to_media_local_path,
     delete_if_local,
 )
 
+# === Логи событий =============================================================
+from src.services.events import (
+    log_event,
+    make_tx_diff,
+    TRANSACTION_CREATED,
+    TRANSACTION_UPDATED,
+    TRANSACTION_RECEIPT_ADDED,
+    TRANSACTION_RECEIPT_REPLACED,
+    TRANSACTION_RECEIPT_REMOVED,
+)
+
 router = APIRouter()
 
-# ===== Общие вспомогательные (квантизация) ===================================
+# ===== Вспомогательные (квантизация) =========================================
 
 def _quant_for_decimals(decimals: int) -> Decimal:
     if decimals <= 0:
@@ -112,6 +125,60 @@ def _require_membership_incl_deleted_group(db: Session, group_id: int, user_id: 
     )
     if not is_member:
         raise HTTPException(status_code=403, detail="User is not a group member")
+
+# ===== Хелперы снапшотов/идемпотентности для логов ============================
+
+_LOG_FIELDS = (
+    "type", "amount", "currency_code", "date", "comment",
+    "category_id", "paid_by", "split_type", "transfer_from", "transfer_to", "receipt_url",
+)
+
+def _short_hash(s: str) -> str:
+    return hashlib.sha256(s.encode("utf-8")).hexdigest()[:16]
+
+def _shares_list_from_aggregated(agg: Dict[int, Dict[str, Decimal | int | None]], decimals: int):
+    items = []
+    for uid, payload in agg.items():
+        items.append({
+            "user_id": uid,
+            "amount": str(q(Decimal(str(payload["amount"])), decimals)),
+            "shares": int(payload["shares"]) if payload.get("shares") else None,
+        })
+    return sorted(items, key=lambda x: x["user_id"])
+
+def _shares_list_from_tx(tx: Transaction, decimals_fallback: int = 2):
+    items = []
+    for s in (tx.shares or []):
+        # amount может быть Decimal — сериализуем как строку
+        amt = s.amount
+        if isinstance(amt, Decimal):
+            amt_str = str(amt)
+        else:
+            # на всякий — в строку
+            amt_str = str(Decimal(str(amt)) if amt is not None else "0")
+        items.append({
+            "user_id": s.user_id,
+            "amount": amt_str,
+            "shares": int(s.shares) if s.shares is not None else None,
+        })
+    return sorted(items, key=lambda x: x["user_id"])
+
+def _tx_snapshot_core(tx: Transaction, shares_list: List[Dict]) -> Dict:
+    snap = {k: getattr(tx, k, None) for k in _LOG_FIELDS}
+    # amount может быть Decimal
+    if isinstance(snap.get("amount"), Decimal):
+        snap["amount"] = str(snap["amount"])
+    # transfer_to — лист int
+    snap["transfer_to"] = list(tx.transfer_to or []) if getattr(tx, "transfer_to", None) else []
+    snap["shares"] = shares_list
+    return snap
+
+def _tx_payload_for_created(tx: Transaction, decimals_fallback: int = 2) -> Dict:
+    shares = _shares_list_from_tx(tx, decimals_fallback)
+    payload = _tx_snapshot_core(tx, shares)
+    payload["transaction_id"] = tx.id
+    payload["group_id"] = tx.group_id
+    return payload
 
 # ===== Схемы для входа (привязка URL чека) ===================================
 
@@ -277,7 +344,7 @@ def create_transaction(
     tx_dict["currency_code"] = tx_currency
     new_tx = Transaction(**tx_dict)
     db.add(new_tx)
-    db.flush()
+    db.flush()  # получим new_tx.id
 
     if aggregated_shares:
         shares_objs = []
@@ -291,6 +358,37 @@ def create_transaction(
                 )
             )
         db.add_all(shares_objs)
+
+    # ---- ЛОГ: создание транзакции (в той же транзакции) ----------------------
+    # payload — «снапшот» создаваемой транзакции.
+    payload = {
+        "id": None,  # для читаемости — ниже переопределим
+        "group_id": new_tx.group_id,
+        "type": new_tx.type,
+        "amount": str(total_amount),
+        "currency_code": tx_currency,
+        "date": new_tx.date,
+        "comment": new_tx.comment,
+        "category_id": new_tx.category_id,
+        "paid_by": new_tx.paid_by,
+        "split_type": new_tx.split_type,
+        "transfer_from": new_tx.transfer_from,
+        "transfer_to": list(new_tx.transfer_to or []),
+        "shares": _shares_list_from_aggregated(aggregated_shares, decimals) if aggregated_shares else [],
+    }
+    payload["id"] = new_tx.id
+    idk = f"tx:{new_tx.id}:created"
+
+    log_event(
+        db,
+        type=TRANSACTION_CREATED,
+        actor_id=current_user.id,
+        group_id=new_tx.group_id,
+        target_user_id=None,
+        data=payload,
+        transaction_id=new_tx.id,
+        idempotency_key=idk,
+    )
 
     db.commit()
 
@@ -367,6 +465,11 @@ def update_transaction(
         if any(uid not in member_ids for uid in patch.transfer_to):
             raise HTTPException(status_code=400, detail="All transfer_to users must be group members")
 
+    # ---- SNAPSHOT "до" -------------------------------------------------------
+    before_shares = _shares_list_from_tx(tx, decimals)
+    before = _tx_snapshot_core(tx, before_shares)
+
+    # ---- Применяем изменения --------------------------------------------------
     aggregated_shares: Dict[int, Dict[str, Decimal | int | None]] = {}
     if patch.shares:
         for share in patch.shares:
@@ -425,6 +528,33 @@ def update_transaction(
                 )
             )
         db.add_all(shares_objs)
+
+    # ---- SNAPSHOT "после" (без дополнительного запроса) ----------------------
+    after_tmp = Transaction()
+    # копируем «видимые» поля
+    for f in _LOG_FIELDS:
+        setattr(after_tmp, f, getattr(tx, f, None))
+    # shares на основе aggregated_shares, если они были переданы, иначе — прежние
+    if aggregated_shares:
+        after_shares = _shares_list_from_aggregated(aggregated_shares, decimals)
+    else:
+        after_shares = before_shares  # не менялись
+    after = _tx_snapshot_core(after_tmp, after_shares)
+
+    # ---- Дифф и лог ----------------------------------------------------------
+    diff = make_tx_diff(before, after)
+    if diff.get("changed"):
+        idk = f"tx:{tx.id}:upd:{_short_hash(json.dumps(diff, sort_keys=True, default=str))}"
+        log_event(
+            db,
+            type=TRANSACTION_UPDATED,
+            actor_id=current_user.id,
+            group_id=tx.group_id,
+            target_user_id=None,
+            data=diff,
+            transaction_id=tx.id,
+            idempotency_key=idk,
+        )
 
     db.commit()
 
@@ -509,8 +639,39 @@ def set_transaction_receipt_by_url(
     ensure_group_active(group)
 
     old_url = tx.receipt_url
+    new_abs = str(to_abs_media_url(payload.url, request))
 
-    tx.receipt_url = to_abs_media_url(payload.url, request)
+    # Определим тип события
+    if not old_url and new_abs:
+        evt_type = TRANSACTION_RECEIPT_ADDED
+        idk = f"tx:{tx.id}:rcpt:add:{_short_hash(new_abs)}"
+        evt_data = {"old_url": None, "new_url": new_abs}
+    elif old_url and new_abs and old_url != new_abs:
+        evt_type = TRANSACTION_RECEIPT_REPLACED
+        idk = f"tx:{tx.id}:rcpt:repl:{_short_hash(old_url + '->' + new_abs)}"
+        evt_data = {"old_url": old_url, "new_url": new_abs}
+    else:
+        # Ничего не меняется — просто вернём текущую
+        if getattr(tx, "receipt_url", None) and request is not None:
+            tx.receipt_url = to_abs_media_url(tx.receipt_url, request)
+        _attach_related_users(db, tx)
+        return tx
+
+    # Применяем
+    tx.receipt_url = new_abs
+
+    # ЛОГ до коммита
+    log_event(
+        db,
+        type=evt_type,
+        actor_id=current_user.id,
+        group_id=tx.group_id,
+        target_user_id=None,
+        data=evt_data,
+        transaction_id=tx.id,
+        idempotency_key=idk,
+    )
+
     db.commit()
     db.refresh(tx)
 
@@ -551,9 +712,25 @@ def delete_transaction_receipt(
     ensure_group_active(group)
 
     old_url = tx.receipt_url
+    if not old_url:
+        return Response(status_code=status.HTTP_204_NO_CONTENT)
 
     tx.receipt_url = None
     # по желанию: tx.receipt_data = None
+
+    # ЛОГ до коммита
+    idk = f"tx:{tx.id}:rcpt:rm:{_short_hash(old_url)}"
+    log_event(
+        db,
+        type=TRANSACTION_RECEIPT_REMOVED,
+        actor_id=current_user.id,
+        group_id=tx.group_id,
+        target_user_id=None,
+        data={"old_url": old_url},
+        transaction_id=tx.id,
+        idempotency_key=idk,
+    )
+
     db.commit()
 
     delete_if_local(old_url, allowed_subdirs=("receipts",))
