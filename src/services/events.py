@@ -1,7 +1,10 @@
 # src/services/events.py
 from __future__ import annotations
 from typing import Any, Dict, Optional
+
 from sqlalchemy.orm import Session
+from sqlalchemy.dialects.postgresql import insert as pg_insert
+
 from src.models.event import Event
 
 # Рекомендуемые константы типов (используй в роутерах)
@@ -38,19 +41,43 @@ def log_event(
     idempotency_key: Optional[str] = None,
 ) -> Event:
     """
-    Единая точка записи событий.
-    Важно: вызывай в той же транзакции, что и бизнес-операция (до db.commit()).
-    Ничего не коммитит сама — только добавляет объект в сессию.
+    Единая точка записи событий. Вызывается в той же транзакции, что и бизнес-операция.
+    Не делает commit. Если задан idempotency_key — обеспечиваем идемпотентность без IntegrityError.
     """
-    ev = Event(
-        type=type,
-        actor_id=actor_id,
-        group_id=group_id,
-        target_user_id=target_user_id,
-        transaction_id=transaction_id,
-        data=(data or {}),
-        idempotency_key=idempotency_key,
-    )
+    payload = {
+        "type": type,
+        "actor_id": actor_id,
+        "group_id": group_id,
+        "target_user_id": target_user_id,
+        "transaction_id": transaction_id,
+        "data": (data or {}),
+        "idempotency_key": idempotency_key,
+    }
+
+    if idempotency_key:
+        # PostgreSQL: ON CONFLICT DO NOTHING по уникальному ключу idempotency_key
+        stmt = (
+            pg_insert(Event.__table__)
+            .values(**payload)
+            .on_conflict_do_nothing(index_elements=["idempotency_key"])
+            .returning(Event.id)
+        )
+        res = db.execute(stmt)
+        inserted_id = res.scalar_one_or_none()
+        if inserted_id is not None:
+            # подхватим ORM-объект для удобства
+            return db.query(Event).filter(Event.id == inserted_id).first()  # type: ignore
+        # конфликт: запись уже есть — вернём существующую
+        existing = db.query(Event).filter(Event.idempotency_key == idempotency_key).first()
+        if existing:
+            return existing
+        # крайне маловероятно, но на всякий случай создадим ORM-объект (не должно сюда доходить)
+        ev = Event(**payload)
+        db.add(ev)
+        return ev
+
+    # без идемпотентности — обычная ORM-вставка
+    ev = Event(**payload)
     db.add(ev)
     return ev
 

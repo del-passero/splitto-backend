@@ -11,47 +11,56 @@ from sqlalchemy.orm import Session
 from src.db import get_db
 from src.models.event import Event
 from src.models.group_member import GroupMember
-from src.schemas.event import EventOut  # у тебя уже есть схема EventOut
+from src.schemas.event import EventOut
 from src.utils.telegram_dep import get_current_telegram_user
 from src.models.user import User
 
 router = APIRouter(prefix="/events", tags=["События"])
 
+
 # -------- фильтрация по "чипам" (types[]) --------
-# Поддержим прежние чипы + базовые префиксы.
-# Можно расширять без миграций — это просто условия в запросе.
 def _apply_types_filter(q, types: Optional[List[str]]):
     if not types:
         return q
 
-    # Нормализуем к нижнему регистру
     tset = {t.lower().strip() for t in types if t and t.strip()}
     if not tset:
         return q
 
     clauses = []
+
     # Группы
     if "group" in tset:
         clauses.append(Event.type.like("group_%"))
-    # Пользователи/участники (дружба, участники групп)
-    if "user" in tset:
+
+    # Пользователи/участники/дружба (и алиас "member")
+    if "user" in tset or "member" in tset:
         clauses.append(Event.type.like("user_%"))
         clauses.append(Event.type.like("member_%"))
         clauses.append(Event.type.like("friendship_%"))
-        clauses.append(Event.type.in_(["friend_added", "friend_hidden", "friend_unhidden", "invite_registered"]))  # старые типы, если где-то остались
-    # Транзакции (все)
+        # легаси-типы, если где-то остались
+        clauses.append(
+            Event.type.in_(
+                ["friend_added", "friend_hidden", "friend_unhidden", "invite_registered"]
+            )
+        )
+
+    # Транзакции
     if "transaction" in tset:
         clauses.append(Event.type.like("transaction_%"))
-    # "update" — всё, что явно апдейты
-    if "update" in tset:
-        clauses.append(Event.type.in_(["transaction_updated", "group_renamed", "group_avatar_changed"]))
 
-    # Если передали полноценные типы (точные совпадения), тоже поддержим
-    other_exact = [t for t in tset if t not in {"group", "user", "member", "transaction", "update"}]
+    # Обновления
+    if "update" in tset:
+        clauses.append(
+            Event.type.in_(["transaction_updated", "group_renamed", "group_avatar_changed"])
+        )
+
+    # Точные типы (всё, что не является чипом)
+    chip_words = {"group", "user", "member", "transaction", "update"}
+    other_exact = [t for t in tset if t not in chip_words]
     if other_exact:
         clauses.append(Event.type.in_(other_exact))
 
-    # Соединяем OR, но оборачиваем в один AND с исходным запросом
     if clauses:
         q = q.where(or_(*clauses))
     return q
@@ -108,6 +117,8 @@ def list_events(
 
     base = _apply_types_filter(base, types)
 
-    base = base.order_by(Event.created_at.desc()).offset(offset).limit(limit)
+    # стабильный порядок при одинаковом created_at
+    base = base.order_by(Event.created_at.desc(), Event.id.desc()).offset(offset).limit(limit)
+
     rows = db.execute(base).scalars().all()
     return rows
