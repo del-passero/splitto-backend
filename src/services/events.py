@@ -1,6 +1,8 @@
 # src/services/events.py
 from __future__ import annotations
 from typing import Any, Dict, Optional
+from datetime import date, datetime
+from decimal import Decimal
 
 from sqlalchemy.orm import Session
 from sqlalchemy.dialects.postgresql import insert as pg_insert
@@ -29,6 +31,34 @@ TRANSACTION_RECEIPT_REPLACED = "transaction_receipt_replaced"
 TRANSACTION_RECEIPT_REMOVED = "transaction_receipt_removed"
 
 
+def _jsonify(obj: Any) -> Any:
+    """
+    Преобразует произвольный объект к JSON-совместимому виду:
+    - datetime/date -> isoformat()
+    - Decimal -> str
+    - set/tuple -> list
+    - dict/list рекурсивно
+    - остальное — как есть (или str на всякий случай)
+    """
+    if obj is None:
+        return None
+    if isinstance(obj, (str, int, float, bool)):
+        return obj
+    if isinstance(obj, (datetime, date)):
+        return obj.isoformat()
+    if isinstance(obj, Decimal):
+        return str(obj)
+    if isinstance(obj, dict):
+        return {str(k): _jsonify(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple, set)):
+        return [_jsonify(v) for v in obj]
+    # Фолбэк, чтобы не уронить сериализацию экзотикой
+    try:
+        return str(obj)
+    except Exception:
+        return None
+
+
 def log_event(
     db: Session,
     *,
@@ -50,7 +80,8 @@ def log_event(
         "group_id": group_id,
         "target_user_id": target_user_id,
         "transaction_id": transaction_id,
-        "data": (data or {}),
+        # КЛЮЧЕВОЕ: делаем JSON-совместимым перед вставкой в JSONB
+        "data": _jsonify(data or {}),
         "idempotency_key": idempotency_key,
     }
 

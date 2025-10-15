@@ -13,7 +13,6 @@ from typing import List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from sqlalchemy.orm import Session
-from sqlalchemy import func
 
 from src.db import get_db
 from src.models.expense_category import ExpenseCategory
@@ -24,9 +23,9 @@ router = APIRouter()
 
 
 def _localized_name(ec: ExpenseCategory, locale: str) -> str:
-    # Берём name_i18n[locale] → иначе 'en' → иначе 'ru' → иначе любой
-    ni = ec.name_i18n or {}
-    return ni.get(locale) or ni.get("en") or ni.get("ru") or next(iter(ni.values()), ec.key)
+    # Берём name_i18n[locale] → иначе 'en' → иначе 'ru' → иначе любой → иначе key
+    ni = getattr(ec, "name_i18n", None) or {}
+    return ni.get(locale) or ni.get("en") or ni.get("ru") or next(iter(ni.values()), getattr(ec, "key", ""))
 
 
 @router.get("/", response_model=List[ExpenseCategoryLocalizedOut])
@@ -63,7 +62,12 @@ def list_categories(
             "icon": ec.icon,
             "color": ec.color,
             "name": _localized_name(ec, locale),
-            "is_active": ec.is_active,
+            # поля ниже будут проигнорированы, если их нет в схеме (они Optional)
+            "is_income": getattr(ec, "is_income", None),
+            "is_archived": getattr(ec, "is_archived", None),
+            "group_id": getattr(ec, "group_id", None),
+            "created_at": getattr(ec, "created_at", None),
+            "updated_at": getattr(ec, "updated_at", None),
         }
         for ec in items
     ]
@@ -78,4 +82,20 @@ def get_category(
     ec = db.query(ExpenseCategory).filter(ExpenseCategory.id == category_id).first()
     if not ec:
         raise HTTPException(status_code=404, detail="Категория не найдена")
-    return ec
+
+    # КЛЮЧЕВОЕ: формируем ответ с полем name (иначе падал Pydantic)
+    # Локаль как в списке по умолчанию — 'ru'
+    locale = "ru"
+    return {
+        "id": ec.id,
+        "key": ec.key,
+        "parent_id": ec.parent_id,
+        "icon": ec.icon,
+        "color": ec.color,
+        "name": _localized_name(ec, locale),
+        "is_income": getattr(ec, "is_income", None),
+        "is_archived": getattr(ec, "is_archived", None),
+        "group_id": getattr(ec, "group_id", None),
+        "created_at": getattr(ec, "created_at", None),
+        "updated_at": getattr(ec, "updated_at", None),
+    }

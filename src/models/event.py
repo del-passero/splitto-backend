@@ -17,18 +17,19 @@ class Event(Base):
     # над кем действие (например, дружба/удаление участника) — может быть NULL
     target_user_id = Column(Integer, nullable=True)
 
-    # (НОВОЕ) связь с транзакцией, если событие о транзакции
+    # связь с транзакцией, если событие о транзакции
     transaction_id = Column(Integer, nullable=True)
 
     # тип события
     type = Column(String(64), nullable=False)
 
     # произвольные данные события
-    data = Column(JSONB, nullable=True, default={})
+    # ВАЖНО: не использовать {} как значение по умолчанию (mutable default)
+    data = Column(JSONB, nullable=True, default=dict)
 
     created_at = Column(DateTime, nullable=False, server_default=func.now())
 
-    # (НОВОЕ) идемпотентный ключ, чтобы не записывать дубль при ретраях
+    # идемпотентный ключ, чтобы не записывать дубль при ретраях
     idempotency_key = Column(String(64), nullable=True)
 
     __table_args__ = (
