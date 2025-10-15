@@ -3,11 +3,11 @@ from __future__ import annotations
 
 from datetime import date, timedelta
 from decimal import Decimal, ROUND_HALF_UP
-from typing import Literal, Optional, Sequence, Dict, List
+from typing import Literal, Optional, Dict, List
 
 from fastapi import APIRouter, Depends, Query, Request
 from sqlalchemy import and_, desc, func, or_, select
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, aliased
 
 from src.db import get_db
 from src.utils.telegram_dep import get_current_telegram_user
@@ -257,6 +257,7 @@ def get_top_categories(
     currency: Optional[str] = Query(None),
     limit: int = Query(50, ge=1, le=500),
     offset: int = Query(0, ge=0),
+    locale: Optional[str] = Query(None, description="Приоритетная локаль для имени категории (ru/en/es)"),
     db: Session = Depends(get_db),
     current_user=Depends(get_current_telegram_user),
 ):
@@ -266,7 +267,10 @@ def get_top_categories(
     if not group_ids:
         return TopCategoriesOut(period=period, items=[], total=0)
 
+    # Приоритет локалей: ?locale → user.locale → Accept-Language → en,ru,es
     locales: list[str] = []
+    if locale:
+        locales.append(str(locale).split("-")[0].lower())
     user_locale = getattr(current_user, "locale", None)
     if user_locale:
         locales.append(str(user_locale).split("-")[0].lower())
@@ -289,10 +293,15 @@ def get_top_categories(
     if currency:
         where_clause.append(Transaction.currency_code == currency)
 
+    # Локализованное имя
     name_candidates = [ExpenseCategory.name_i18n[loc].astext for loc in locales]
     cat_name_expr = func.coalesce(*name_candidates, ExpenseCategory.key).label("name")
 
     sum_amount = func.sum(Transaction.amount).label("sum_amount")
+
+    # Цвет категории: берём цвет самой категории, если нет — цвет родителя
+    Parent = aliased(ExpenseCategory)
+    color_expr = func.coalesce(ExpenseCategory.color, Parent.color).label("color")
 
     base = (
         select(
@@ -300,13 +309,19 @@ def get_top_categories(
             cat_name_expr,
             Transaction.currency_code.label("currency"),
             sum_amount,
+            ExpenseCategory.icon.label("icon"),
+            color_expr,
         )
         .join(ExpenseCategory, ExpenseCategory.id == Transaction.category_id)
+        .outerjoin(Parent, Parent.id == ExpenseCategory.parent_id)
         .where(and_(*where_clause))
         .group_by(
             Transaction.category_id,
             cat_name_expr,
             Transaction.currency_code,
+            ExpenseCategory.icon,
+            ExpenseCategory.color,
+            Parent.color,
         )
         .order_by(desc(sum_amount))
     )
@@ -320,6 +335,8 @@ def get_top_categories(
             name=row.name,
             sum=f"{(row.sum_amount or 0):.2f}",
             currency=row.currency,
+            icon=row.icon,
+            color=row.color,
         )
         for row in rows
     ]
