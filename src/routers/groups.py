@@ -27,7 +27,6 @@ from src.models.transaction_share import TransactionShare
 from src.models.group_hidden import GroupHidden
 from src.models.currency import Currency
 from src.models.event import Event
-from src.services.events import log_event, GROUP_DELETED
 from src.schemas.group import GroupCreate, GroupOut, GroupSettleAlgoEnum
 from src.schemas.group_member import GroupMemberOut
 from src.schemas.user import UserOut
@@ -55,7 +54,9 @@ from src.services.events import (
     GROUP_DELETED,
     GROUP_ARCHIVED,
     GROUP_UNARCHIVED,
+    GROUP_RESTORED,  
 )
+from src.services.friends import ensure_friendship
 
 router = APIRouter()
 
@@ -109,29 +110,53 @@ def get_group_transactions(db: Session, group_id: int) -> List[Transaction]:
     )
 
 
-def add_member_to_group(db: Session, group_id: int, user_id: int):
+def add_member_to_group(
+    db: Session,
+    group_id: int,
+    user_id: int,
+    inviter_id: Optional[int] = None,  # ← кто добавляет (актёр события дружбы)
+):
     """
     Идемпотентное добавление:
       - если уже активен — ничего не делаем;
       - если есть soft-deleted запись — реактивируем (deleted_at=NULL);
       - иначе — создаём новую запись.
+    Плюс: если задан inviter_id и inviter_id != user_id, гарантируем дружбу
+    inviter_id <-> user_id и логируем friendship_created (идемпотентно).
     """
     exists = db.query(GroupMember).filter(
         GroupMember.group_id == group_id,
         GroupMember.user_id == user_id
     ).first()
-    if exists:
-        if exists.deleted_at is not None:
-            exists.deleted_at = None
-            db.add(exists)
-            db.commit()
-            db.refresh(exists)
+
+    # уже есть активный membership
+    if exists and exists.deleted_at is None:
         return
 
+    # реанимация soft-deleted
+    if exists and exists.deleted_at is not None:
+        exists.deleted_at = None
+        db.add(exists)
+        db.commit()
+        db.refresh(exists)
+
+        # дружба по правилу "кто добавил -> кого добавили"
+        if inviter_id and inviter_id != user_id:
+            ensure_friendship(db, inviter_id=inviter_id, invitee_id=user_id, group_id=group_id)
+            db.commit()
+        return
+
+    # новая запись
     db_member = GroupMember(group_id=group_id, user_id=user_id)
     db.add(db_member)
     db.commit()
     db.refresh(db_member)
+
+    # дружба по правилу "кто добавил -> кого добавили"
+    if inviter_id and inviter_id != user_id:
+        ensure_friendship(db, inviter_id=inviter_id, invitee_id=user_id, group_id=group_id)
+        db.commit()
+
 
 
 def _has_active_transactions(db: Session, group_id: int) -> bool:
@@ -698,6 +723,16 @@ def restore_group(
     group.deleted_at = None
     group.status = GroupStatus.active
     group.archived_at = None
+    
+    # лог восстановления из удалённых
+    log_event(
+        db,
+        type=GROUP_RESTORED,
+        actor_id=current_user.id,
+        group_id=group.id,
+        data={"group_id": group.id},
+    )    
+    
     db.commit()
     if return_full:
         db.refresh(group)

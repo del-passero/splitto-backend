@@ -3,7 +3,7 @@
 # -----------------------------------------------------------------------------
 # Soft-delete для членства, ре-активация, мультивалютные проверки нулевого баланса.
 
-from typing import List, Optional, Union, Dict
+from typing import List, Optional, Union, Dict, Tuple
 from datetime import datetime
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -39,6 +39,7 @@ from src.services.events import (
     MEMBER_ADDED,
     MEMBER_REMOVED,
     MEMBER_LEFT,
+    FRIENDSHIP_CREATED,  # ← добавили
 )
 
 router = APIRouter()
@@ -48,15 +49,30 @@ def _err(code: str, message: str) -> Dict[str, str]:
     return {"code": code, "message": message}
 
 
-def _pair_min_max(a: int, b: int) -> (int, int):
+def _pair_min_max(a: int, b: int) -> Tuple[int, int]:
     return (a, b) if a < b else (b, a)
 
 
-def add_mutual_friends_for_group(db: Session, group_id: int):
+def add_mutual_friends_for_group(
+    db: Session,
+    group_id: int,
+    *,
+    new_member_id: Optional[int] = None,
+    inviter_id: Optional[int] = None,
+    via: Optional[str] = None,
+):
     """
-    Bulk-добавление дружбы между ВСЕМИ активными участниками (deleted_at IS NULL)
-    под каноническую модель дружбы: одна строка на пару (user_min, user_max).
+    Создаёт недостающие дружбы между ВСЕМИ активными участниками (deleted_at IS NULL),
+    И при этом логирует события friendship_created ТОЛЬКО для пар, где участвует new_member_id.
+    Событие делаем приватным: НЕ указываем group_id (увидят только двое участников).
+
+    actor_id:
+      • если пара = (inviter_id ↔ new_member_id) и inviter_id задан — actor = inviter_id;
+      • иначе — actor = new_member_id.
+
+    Идемпотентность: idempotency_key = friendship_created:{umin}:{umax}.
     """
+    # все активные участники
     member_ids = [
         m[0]
         for m in db.query(GroupMember.user_id)
@@ -78,16 +94,56 @@ def add_mutual_friends_for_group(db: Session, group_id: int):
     }
 
     to_create: List[Friend] = []
+    new_pairs: List[Tuple[int, int]] = []  # (umin, umax)
+
     # Пройдемся по всем комбинациям (i < j), создадим недостающие пары
     for i in range(len(member_ids)):
         for j in range(i + 1, len(member_ids)):
             u1, u2 = member_ids[i], member_ids[j]
             umin, umax = _pair_min_max(u1, u2)
             if (umin, umax) not in existing_pairs:
-                to_create.append(Friend(user_min=umin, user_max=umax, hidden_by_min=False, hidden_by_max=False))
+                to_create.append(
+                    Friend(
+                        user_min=umin,
+                        user_max=umax,
+                        hidden_by_min=False,
+                        hidden_by_max=False,
+                        # legacy-поля могут отсутствовать в модели — если есть, ORM проставит по умолчанию
+                    )
+                )
+                new_pairs.append((umin, umax))
 
     if to_create:
         db.bulk_save_objects(to_create)
+        db.flush()  # дружбы появились в текущей транзакции
+
+        # Логируем события ТОЛЬКО для связок с new_member_id
+        if new_member_id is not None:
+            for umin, umax in new_pairs:
+                if new_member_id != umin and new_member_id != umax:
+                    continue  # событие пишем только для пар, где участвует новый участник
+
+                # Определяем актёра/таргета
+                other = umax if new_member_id == umin else umin
+                actor_id = (
+                    inviter_id
+                    if inviter_id
+                    and ((inviter_id == umin and new_member_id == umax) or (inviter_id == umax and new_member_id == umin))
+                    else new_member_id
+                )
+                target_user_id = other if actor_id == new_member_id else new_member_id
+
+                # приватное событие (group_id=None), но в data можно оставить контекст группового происхождения
+                log_event(
+                    db,
+                    type=FRIENDSHIP_CREATED,
+                    actor_id=actor_id,
+                    target_user_id=target_user_id,
+                    group_id=None,
+                    data={"via": via or "auto_group_friendship", "group_id": group_id},
+                    idempotency_key=f"friendship_created:{umin}:{umax}",
+                )
+
         db.commit()
 
 
@@ -137,6 +193,8 @@ def add_group_member(
       • Доступ — ЛЮБОЙ участник активной группы.
       • Реактивация: если запись существует и soft-deleted — выставляем deleted_at=NULL.
       • Ошибка 400, если уже активный участник.
+      • После успешного добавления гарантируем дружбу «всех со всеми» и логируем
+        friendship_created ТОЛЬКО для связок с добавленным участником (приватно).
     """
     group = guard_mutation_for_member(db, member.group_id, current_user.id)
 
@@ -166,7 +224,15 @@ def add_group_member(
 
         db.commit()
         db.refresh(existing)
-        add_mutual_friends_for_group(db, member.group_id)
+
+        # Автодружба и приватные события для связок с ре-активированным участником
+        add_mutual_friends_for_group(
+            db,
+            member.group_id,
+            new_member_id=member.user_id,
+            inviter_id=current_user.id,
+            via="admin_add",
+        )
         return existing
 
     # Уже активный — 400
@@ -189,7 +255,15 @@ def add_group_member(
 
     db.commit()
     db.refresh(db_member)
-    add_mutual_friends_for_group(db, member.group_id)
+
+    # Автодружба и приватные события для связок с добавленным участником
+    add_mutual_friends_for_group(
+        db,
+        member.group_id,
+        new_member_id=member.user_id,
+        inviter_id=current_user.id,
+        via="admin_add",
+    )
     return db_member
 
 

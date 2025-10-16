@@ -19,6 +19,7 @@ GROUP_AVATAR_CHANGED = "group_avatar_changed"
 GROUP_DELETED = "group_deleted"
 GROUP_ARCHIVED = "group_archived"
 GROUP_UNARCHIVED = "group_unarchived"
+GROUP_RESTORED = "group_restored"   
 
 MEMBER_ADDED = "member_added"
 MEMBER_REMOVED = "member_removed"

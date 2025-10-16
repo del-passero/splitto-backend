@@ -20,7 +20,7 @@ from src.services.group_invite_token import (
 )
 from src.services.group_membership import is_member, ensure_member
 
-# используем готовую утилиту автодобавления друзей из routers/group_members
+# используем утилиту автодобавления друзей (теперь с логами дружбы)
 from src.routers.group_members import add_mutual_friends_for_group
 
 router = APIRouter(tags=["Инвайты групп"])
@@ -213,6 +213,7 @@ async def accept_group_invite(
     """
     Принять инвайт: создаём пользователя при необходимости, активируем/создаём membership
     и после успешного вступления добавляем взаимную дружбу между всеми активными участниками.
+    События friendship_created логируются только для связок с НОВЫМ участником (group_id не указываем).
     Возвращает { success: true, group_id }.
     """
     # 1) initData
@@ -232,12 +233,13 @@ async def accept_group_invite(
         raise HTTPException(status_code=400, detail={"code": "bad_token"})
 
     parsed_group_id: Optional[int] = None
+    inviter_id: Optional[int] = None
     parse_err: Optional[str] = None
 
     for cand in candidates:
         try:
-            gid, _ = parse_and_validate_token(cand)
-            parsed_group_id = gid
+            gid, inv = parse_and_validate_token(cand)
+            parsed_group_id, inviter_id = gid, inv
             parse_err = None
             break
         except ValueError as e:
@@ -259,9 +261,16 @@ async def accept_group_invite(
     # 5) вступаем (создаём/реактивируем)
     ensure_member(db, parsed_group_id, current_user.id)
 
-    # 6) автодружба между всеми активными участниками группы
+    # 6) автодружба: создадим недостающие пары между ВСЕМИ участниками,
+    # а события friendship_created запишем ТОЛЬКО для связок с new_member.
     try:
-        add_mutual_friends_for_group(db, parsed_group_id)
+        add_mutual_friends_for_group(
+            db,
+            parsed_group_id,
+            new_member_id=current_user.id,
+            inviter_id=inviter_id,
+            via="group_invite",
+        )
     except Exception as e:
         # не блокируем вступление из-за дружбы; логируем
         LOG.warning("add_mutual_friends_for_group failed: %s", e)
