@@ -25,6 +25,8 @@ from src.models.transaction import Transaction
 from src.models.transaction_share import TransactionShare
 from src.models.group_hidden import GroupHidden
 from src.models.currency import Currency
+from src.models.event import Event
+from src.services.events import log_event, GROUP_DELETED
 from src.schemas.group import GroupCreate, GroupOut, GroupSettleAlgoEnum
 from src.schemas.group_member import GroupMemberOut
 from src.schemas.user import UserOut
@@ -644,7 +646,7 @@ def soft_delete_group(
             group_id=group.id,
             data={"group_id": group.id, "mode": "hard"},
         )
-        _hard_delete_group_impl(db, group_id)
+        _hard_delete_group_impl(db, group_id, actor_id=current_user.id)
         return
 
     # Если есть активные транзакции — проверяем долги, затем soft
@@ -701,35 +703,38 @@ def restore_group(
 
 # ===== Hard-delete ============================================================
 
-def _hard_delete_group_impl(db: Session, group_id: int):
+def _hard_delete_group_impl(db: Session, group_id: int, actor_id: int | None = None) -> None:
     """
-    Жёсткое удаление зависимостей + самой группы. После успешного commit
-    пробуем удалить локальный файл аватара (если был и если локальный).
-
-    NB: сюда можно прийти как из DELETE /{id}/hard, так и из soft-delete,
-    когда активных транзакций нет (остались только soft-удалённые).
+    Полное удаление группы.
+    ВАЖНО:
+      1) Логируем событие 'group_deleted' ДО удаления, когда FK ещё валиден.
+      2) Отвязываем существующие события (events.group_id -> NULL), чтобы FK не блокировал DELETE groups.
+      3) Удаляем запись группы.
+    Коммит делается выше по стеку (как и раньше).
     """
-    # Сохраним текущий аватар до удаления записи
-    group_row: Optional[Group] = db.query(Group).filter(Group.id == group_id).first()
-    avatar_url_before = getattr(group_row, "avatar_url", None) if group_row else None
+    # 1) Лог до удаления (идемпотентно)
+    try:
+        idk = f"group:{group_id}:hard_delete"
+        log_event(
+            db,
+            type=GROUP_DELETED,
+            actor_id=actor_id or 0,
+            group_id=group_id,  # будет «обнулён» шагом 2 — но group_id сохранится в data
+            data={"group_id": group_id, "mode": "hard"},
+            idempotency_key=idk,
+        )
+    except Exception:
+        # Логи не должны мешать удалению группы
+        pass
 
-    # 1) Сначала чистим шейры → транзакции (чтобы не ловить FK на transactions.group_id)
-    tx_ids = [tid for (tid,) in db.query(Transaction.id).filter(Transaction.group_id == group_id).all()]
-    if tx_ids:
-        db.query(TransactionShare).filter(TransactionShare.transaction_id.in_(tx_ids)).delete(synchronize_session=False)
-        db.query(Transaction).filter(Transaction.id.in_(tx_ids)).delete(synchronize_session=False)
+    # 2) Отвязать все события, которые ссылаются на эту группу (иначе FK не даст удалить группу)
+    db.query(Event).filter(Event.group_id == group_id).update(
+        {Event.group_id: None}, synchronize_session=False
+    )
 
-    # 2) Прочие зависимости группы
-    db.query(GroupHidden).filter(GroupHidden.group_id == group_id).delete(synchronize_session=False)
-    db.query(GroupInvite).filter(GroupInvite.group_id == group_id).delete(synchronize_session=False)
-    db.query(GroupMember).filter(GroupMember.group_id == group_id).delete(synchronize_session=False)
-
-    # 3) Сама группа
+    # 3) Удалить саму группу
     db.query(Group).filter(Group.id == group_id).delete(synchronize_session=False)
-    db.commit()
 
-    # После успешного commit — пытаемся удалить локальный файл (только из group_avatars)
-    delete_if_local(avatar_url_before, allowed_subdirs=("group_avatars",))
 
 
 @router.delete("/{group_id}/hard", status_code=status.HTTP_204_NO_CONTENT)
@@ -770,7 +775,7 @@ def hard_delete_group(
         data={"group_id": group.id, "mode": "hard"},
     )
 
-    _hard_delete_group_impl(db, group_id)
+    _hard_delete_group_impl(db, group_id, actor_id=current_user.id)
 
 # ===== Смена валюты группы ====================================================
 
