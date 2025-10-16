@@ -20,6 +20,7 @@ from src.db import get_db
 from src.models.group import Group, GroupStatus, SettleAlgorithm
 from src.models.group_member import GroupMember
 from src.models.group_invite import GroupInvite
+from src.models.group_hidden import GroupHidden
 from src.models.user import User
 from src.models.transaction import Transaction
 from src.models.transaction_share import TransactionShare
@@ -31,6 +32,8 @@ from src.schemas.group import GroupCreate, GroupOut, GroupSettleAlgoEnum
 from src.schemas.group_member import GroupMemberOut
 from src.schemas.user import UserOut
 from src.utils.telegram_dep import get_current_telegram_user
+
+
 from src.utils.groups import (
     require_owner,
     ensure_group_active,
@@ -703,37 +706,57 @@ def restore_group(
 
 # ===== Hard-delete ============================================================
 
+from sqlalchemy import select
+from src.models.event import Event
+from src.models.group_hidden import GroupHidden
+from src.models.group_invite import GroupInvite
+from src.models.group_member import GroupMember
+from src.models.transaction import Transaction
+from src.models.transaction_share import TransactionShare
+# (+ при необходимости подключите другие модели с FK на groups.id)
+
 def _hard_delete_group_impl(db: Session, group_id: int, actor_id: int | None = None) -> None:
-    """
-    Полное удаление группы.
-    ВАЖНО:
-      1) Логируем событие 'group_deleted' ДО удаления, когда FK ещё валиден.
-      2) Отвязываем существующие события (events.group_id -> NULL), чтобы FK не блокировал DELETE groups.
-      3) Удаляем запись группы.
-    Коммит делается выше по стеку (как и раньше).
-    """
-    # 1) Лог до удаления (идемпотентно)
+    # сохранить путь к аватару до удаления группы
+    group_row: Optional[Group] = db.query(Group).filter(Group.id == group_id).first()
+    avatar_url_before = getattr(group_row, "avatar_url", None) if group_row else None
+
+    # (опционально) защититься от гонок
+    db.execute(select(Group.id).where(Group.id == group_id).with_for_update())
+
+    # лог события (если хотите — с idempotency_key)
     try:
-        idk = f"group:{group_id}:hard_delete"
         log_event(
             db,
             type=GROUP_DELETED,
             actor_id=actor_id or 0,
-            group_id=group_id,  # будет «обнулён» шагом 2 — но group_id сохранится в data
+            group_id=group_id,
             data={"group_id": group_id, "mode": "hard"},
-            idempotency_key=idk,
         )
     except Exception:
-        # Логи не должны мешать удалению группы
-        pass
+        pass  # логи не должны ломать удаление
 
-    # 2) Отвязать все события, которые ссылаются на эту группу (иначе FK не даст удалить группу)
-    db.query(Event).filter(Event.group_id == group_id).update(
-        {Event.group_id: None}, synchronize_session=False
-    )
+    # 1) отвязать события, иначе FK events.group_id помешает
+    db.query(Event).filter(Event.group_id == group_id).update({Event.group_id: None}, synchronize_session=False)
 
-    # 3) Удалить саму группу
+    # 2) транзакции и их шейры (без фильтра по is_deleted — трём все)
+    tx_ids = [tid for (tid,) in db.query(Transaction.id).filter(Transaction.group_id == group_id).all()]
+    if tx_ids:
+        db.query(TransactionShare).filter(TransactionShare.transaction_id.in_(tx_ids)).delete(synchronize_session=False)
+        db.query(Transaction).filter(Transaction.id.in_(tx_ids)).delete(synchronize_session=False)
+
+    # 3) прочие дети группы
+    db.query(GroupHidden).filter(GroupHidden.group_id == group_id).delete(synchronize_session=False)
+    db.query(GroupInvite).filter(GroupInvite.group_id == group_id).delete(synchronize_session=False)
+    db.query(GroupMember).filter(GroupMember.group_id == group_id).delete(synchronize_session=False)
+
+    # 4) сама группа
     db.query(Group).filter(Group.id == group_id).delete(synchronize_session=False)
+
+    # 5) фиксация как раньше — внутри impl
+    db.commit()
+
+    # 6) попытка удалить локальный файл аватара (если наш и уже не нужен)
+    delete_if_local(avatar_url_before, allowed_subdirs=("group_avatars",))
 
 
 
