@@ -30,6 +30,7 @@ TRANSACTION_UPDATED = "transaction_updated"
 TRANSACTION_RECEIPT_ADDED = "transaction_receipt_added"
 TRANSACTION_RECEIPT_REPLACED = "transaction_receipt_replaced"
 TRANSACTION_RECEIPT_REMOVED = "transaction_receipt_removed"
+TRANSACTION_DELETED = "transaction_deleted"
 
 
 def _jsonify(obj: Any) -> Any:

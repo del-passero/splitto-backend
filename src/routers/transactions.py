@@ -52,6 +52,8 @@ from src.services.events import (
     TRANSACTION_RECEIPT_ADDED,
     TRANSACTION_RECEIPT_REPLACED,
     TRANSACTION_RECEIPT_REMOVED,
+    TRANSACTION_DELETED,
+    safe_tx_payload,
 )
 
 router = APIRouter()
@@ -577,6 +579,10 @@ def delete_transaction(
     db: Session = Depends(get_db),
     current_user=Depends(get_current_telegram_user),
 ):
+    """
+    Мягкое удаление транзакции с логированием события и очисткой локального файла чека.
+    Требует активную группу и членство текущего пользователя.
+    """
     tx = db.query(Transaction).filter(Transaction.id == transaction_id).first()
     if not tx:
         raise HTTPException(status_code=404, detail="Транзакция не найдена")
@@ -597,17 +603,41 @@ def delete_transaction(
             },
         )
 
-    # Опционально: подчистим локальный файл чека при удалении транзакции
+    # Сохраняем старый URL чека до изменения
     old_receipt = tx.receipt_url
 
+    # Готовим payload и идемпотентный ключ ДО изменения полей
+    evt_data = {
+        "old_receipt_url": old_receipt,
+        **safe_tx_payload(tx),
+    }
+    idk = f"tx:{tx.id}:deleted"
+
+    # Помечаем удалённой и обнуляем чек
     tx.is_deleted = True
     tx.receipt_url = None
+    # при желании:
+    # tx.receipt_data = None
+
+    # Логируем событие удаления (до коммита)
+    log_event(
+        db,
+        type=TRANSACTION_DELETED,
+        actor_id=current_user.id,
+        group_id=tx.group_id,
+        target_user_id=None,
+        data=evt_data,
+        transaction_id=tx.id,
+        idempotency_key=idk,
+    )
+
     db.commit()
 
-    # Пытаемся удалить локальный файл чека (если он наш и существовал)
+    # Если чек был локальным — удалим файл
     delete_if_local(old_receipt, allowed_subdirs=("receipts",))
 
     return Response(status_code=status.HTTP_204_NO_CONTENT)
+
 
 # ===== Новые эндпоинты: привязка/удаление чека ================================
 

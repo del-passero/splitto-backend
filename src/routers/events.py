@@ -52,7 +52,12 @@ def _apply_types_filter(q, types: Optional[List[str]]):
     # Обновления
     if "update" in tset:
         clauses.append(
-            Event.type.in_(["transaction_updated", "group_renamed", "group_avatar_changed"])
+            Event.type.in_([
+                "transaction_updated",
+                "transaction_deleted",   # добавили, чтобы удаление попадало под чип "update"
+                "group_renamed",
+                "group_avatar_changed",
+            ])
         )
 
     # Точные типы (всё, что не является чипом)
