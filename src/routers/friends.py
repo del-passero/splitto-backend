@@ -21,6 +21,9 @@ from src.utils.telegram_dep import get_current_telegram_user
 from src.models.group_member import GroupMember
 from src.models.group import Group
 
+# >>> добавлено: используем общий логгер событий и константу типа
+from src.services.events import log_event, FRIENDSHIP_CREATED
+
 router = APIRouter(tags=["Друзья"])
 
 
@@ -173,9 +176,15 @@ def accept_invite(
         db.add(link)
         db.commit()
         created_now = True
-        # Логи событий дружбы — по одному на каждого участника
-        db.add(Event(actor_id=from_user_id, target_user_id=to_user_id, type="friend_added", data=None))
-        db.add(Event(actor_id=to_user_id, target_user_id=from_user_id, type="friend_added", data=None))
+
+        # >>> изменено: пишем современное событие дружбы через общий логгер (идемпотентно)
+        log_event(
+            db,
+            type=FRIENDSHIP_CREATED,
+            actor_id=from_user_id,
+            target_user_id=to_user_id,
+            idempotency_key=f"friendship_created:{umin}:{umax}",
+        )
         db.commit()
     else:
         # Уже дружим: снимем скрытие для обоих (на случай, если кто-то скрывал ранее)

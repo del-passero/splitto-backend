@@ -646,7 +646,7 @@ def soft_delete_group(
             db,
             type=GROUP_DELETED,
             actor_id=current_user.id,
-            group_id=group.id,
+            group_id=None,  # важно: не держим FK при жёстком удалении
             data={"group_id": group.id, "mode": "hard"},
         )
         _hard_delete_group_impl(db, group_id, actor_id=current_user.id)
@@ -723,17 +723,6 @@ def _hard_delete_group_impl(db: Session, group_id: int, actor_id: int | None = N
     # (опционально) защититься от гонок
     db.execute(select(Group.id).where(Group.id == group_id).with_for_update())
 
-    # лог события (если хотите — с idempotency_key)
-    try:
-        log_event(
-            db,
-            type=GROUP_DELETED,
-            actor_id=actor_id or 0,
-            group_id=group_id,
-            data={"group_id": group_id, "mode": "hard"},
-        )
-    except Exception:
-        pass  # логи не должны ломать удаление
 
     # 1) отвязать события, иначе FK events.group_id помешает
     db.query(Event).filter(Event.group_id == group_id).update({Event.group_id: None}, synchronize_session=False)
@@ -794,7 +783,7 @@ def hard_delete_group(
         db,
         type=GROUP_DELETED,
         actor_id=current_user.id,
-        group_id=group.id,
+        group_id=None,  # важно: не держим FK при жёстком удалении
         data={"group_id": group.id, "mode": "hard"},
     )
 
